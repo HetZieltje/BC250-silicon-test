@@ -21,14 +21,14 @@ LOG_FILE="${HOME}/.bc250-silicon-test.log"
 
 # Defaults. The user is asked to confirm/change these before testing starts.
 CPU_FREQ=3500
-CPU_START_SCALE=-30
+CPU_START_SCALE=-20
 CPU_STEP=-1
 CPU_MIN_SCALE=-50
 CPU_TEST_SECONDS=30
 CPU_TEST_TEMP=95
 
 GPU_FREQ=1500
-GPU_START_MV=850
+GPU_START_MV=900
 GPU_STEP_MV=-10
 GPU_MIN_MV=600
 GPU_TEST_SECONDS=30
@@ -61,6 +61,7 @@ CPU_FAILURE_REASON=""
 GPU_LAST_PASS="none"
 GPU_FAILURE_POINT="none"
 GPU_FAILURE_REASON=""
+GPU_NOT_RUN=0
 stress_pid=""
 vkmark_pid=""
 
@@ -220,12 +221,12 @@ ask_cpu_values() {
         read -rp "CPU clock MHz [${CPU_FREQ}]: " v
         [[ -z "$v" ]] && v="$CPU_FREQ"
 
-        if validate_positive_int "$v" && (( v >= 100 && v <= 4500 )); then
+        if validate_positive_int "$v" && (( v >= 100 && v <= 5000 )); then
             CPU_FREQ="$v"
             break
         fi
 
-        echo "Invalid CPU clock. Enter a value from 100 to 4500 MHz."
+        echo "Invalid CPU clock. Enter a value from 100 to 5000 MHz."
     done
 
     while true; do
@@ -312,24 +313,24 @@ ask_gpu_values() {
         read -rp "GPU clock MHz [${GPU_FREQ}]: " v
         [[ -z "$v" ]] && v="$GPU_FREQ"
 
-        if validate_positive_int "$v"; then
+        if validate_positive_int "$v" && (( v >= 100 && v <= 3000 )); then
             GPU_FREQ="$v"
             break
         fi
 
-        echo "Invalid GPU clock. Enter a positive integer."
+        echo "Invalid GPU clock. Enter a value from 100 to 3000 MHz."
     done
 
     while true; do
         read -rp "GPU start mV [${GPU_START_MV}]: " v
         [[ -z "$v" ]] && v="$GPU_START_MV"
 
-        if validate_positive_int "$v"; then
+        if validate_positive_int "$v" && (( v >= 600 && v <= 1100 )); then
             GPU_START_MV="$v"
             break
         fi
 
-        echo "Invalid GPU start voltage. Enter a positive integer."
+        echo "Invalid GPU start voltage. Enter a value from 600 to 1100 mV."
     done
 
     while true; do
@@ -348,7 +349,7 @@ ask_gpu_values() {
         read -rp "GPU floor mV [${GPU_MIN_MV}]: " v
         [[ -z "$v" ]] && v="$GPU_MIN_MV"
 
-        if validate_positive_int "$v" && (( v >= 600 && GPU_START_MV >= v )); then
+        if validate_positive_int "$v" && (( v >= 600 && v <= 1100 && GPU_START_MV >= v )); then
             delta=$((GPU_START_MV - v))
             step_abs=$((-GPU_STEP_MV))
 
@@ -361,7 +362,7 @@ ask_gpu_values() {
             continue
         fi
 
-        echo "Invalid GPU floor. It must be at least 600 mV and no higher than the start voltage."
+        echo "Invalid GPU floor. It must be between 600 and 1100 mV and no higher than the start voltage."
     done
 
     while true; do
@@ -415,6 +416,58 @@ show_test_summary() {
         echo "Max temp:   ${GPU_TEST_TEMP}C"
     fi
     echo
+}
+
+show_test_report() {
+    echo
+    echo "=============================================="
+    echo " TEST COMPLETE"
+    echo "=============================================="
+    echo
+    if (( RUN_CPU )); then
+        if [[ "$cpu_rc" -eq 0 ]]; then
+            echo "CPU result: PASS"
+            echo "  Tested: ${CPU_FREQ} MHz, scale ${CPU_START_SCALE} to ${CPU_MIN_SCALE} by ${CPU_STEP}"
+            echo "  Point duration: ${CPU_TEST_SECONDS}s; temperature limit: ${CPU_TEST_TEMP}C"
+            echo "  Last confirmed pass: ${CPU_LAST_PASS}"
+            echo "  Last confirmed pass current VID: ${CPU_LAST_PASS_VID} mV"
+            echo "  VID by scale: ${CPU_VID_HISTORY:-none}"
+        else
+            echo "CPU result: FAILED"
+            echo "  Tested: ${CPU_FREQ} MHz, scale ${CPU_START_SCALE} toward ${CPU_MIN_SCALE} by ${CPU_STEP}"
+            echo "  Point duration: ${CPU_TEST_SECONDS}s; temperature limit: ${CPU_TEST_TEMP}C"
+            echo "  Last confirmed pass: ${CPU_LAST_PASS}"
+            echo "  Last confirmed pass current VID: ${CPU_LAST_PASS_VID} mV"
+            echo "  VID by scale: ${CPU_VID_HISTORY:-none}"
+            echo "  Failure candidate: scale ${CPU_FAILURE_POINT}"
+            echo "  Failure reason: ${CPU_FAILURE_REASON:-see preceding CPU failure details}"
+            echo "  Result meaning: no conclusion below the last confirmed passing scale."
+        fi
+    fi
+
+    if (( RUN_GPU )); then
+        if (( GPU_NOT_RUN )); then
+            echo "GPU result: SKIPPED"
+            echo "  Reason: GPU phase was not started after the CPU phase failed."
+        elif [[ "$gpu_rc" -eq 0 ]]; then
+            echo "GPU result: PASS"
+            echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} to ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
+            echo "  Point duration: ${GPU_TEST_SECONDS}s; temperature limit: ${GPU_TEST_TEMP}C"
+            echo "  Last confirmed pass: ${GPU_LAST_PASS} mV"
+        else
+            echo "GPU result: FAILED"
+            echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} toward ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
+            echo "  Point duration: ${GPU_TEST_SECONDS}s; temperature limit: ${GPU_TEST_TEMP}C"
+            echo "  Last confirmed pass: ${GPU_LAST_PASS} mV"
+            echo "  Failure candidate: ${GPU_FAILURE_POINT} mV"
+            echo "  Failure reason: ${GPU_FAILURE_REASON:-see preceding GPU failure details}"
+            echo "  Result meaning: no conclusion below the last confirmed passing voltage."
+        fi
+    fi
+
+    echo
+    echo "No persistent CPU/GPU tuning configuration was modified."
+    echo "Interpret results as quick silicon-quality thresholds, not long-term stability certification."
 }
 
 ask_test_values() {
@@ -561,6 +614,8 @@ show_previous_state() {
 
     if [[ "$saved_phase" == "GPU" && "$saved_gpu_status" == "IN_PROGRESS" &&
         "$saved_gpu_point" =~ ^[0-9]+$ ]]; then
+        local saved_gpu_last_pass
+
         echo
         echo "The previous GPU phase was interrupted before it completed."
         echo "The saved GPU point is treated as the GPU cutoff: ${saved_gpu_point} mV."
@@ -571,6 +626,7 @@ show_previous_state() {
             return 0
         fi
 
+        saved_gpu_last_pass="$(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE")"
         state_set_field gpu_status "FAILED"
         state_set_field gpu_failure_point "$saved_gpu_point"
         state_set_field gpu_failure_reason "System hard-locked during the GPU point; ${saved_gpu_point} mV is the cutoff."
@@ -578,8 +634,16 @@ show_previous_state() {
         state_set_field point "$saved_gpu_point"
         state_set_field timestamp "$(date '+%Y-%m-%d %H:%M:%S %Z')"
         echo "GPU cutoff recorded at ${saved_gpu_point} mV."
-        echo "Last confirmed GPU pass: $(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE") mV"
+        echo "Last confirmed GPU pass: ${saved_gpu_last_pass:-none} mV"
         echo "The interrupted GPU point will not be retried."
+        RUN_CPU=0
+        RUN_GPU=1
+        cpu_rc=0
+        gpu_rc=12
+        GPU_LAST_PASS="${saved_gpu_last_pass:-none}"
+        GPU_FAILURE_POINT="$saved_gpu_point"
+        GPU_FAILURE_REASON="System hard-locked during the GPU point; ${saved_gpu_point} mV is the cutoff."
+        show_test_report
         exit 0
     fi
 
@@ -1701,7 +1765,10 @@ main() {
         echo "If restoration was not confirmed, the GPU result may be affected."
         echo "Continuing to GPU phase."
     elif (( RUN_CPU )) && [[ "$cpu_rc" -ne 0 ]]; then
-        exit "$cpu_rc"
+        GPU_NOT_RUN=1
+        echo
+        echo "CPU phase failed before the GPU phase could start."
+        echo "The final report will record the GPU phase as skipped."
     elif (( RUN_CPU && RUN_GPU )); then
         echo
         echo "CPU phase complete; restoring ${CPU_BASELINE_SOURCE} before GPU phase."
@@ -1716,7 +1783,7 @@ main() {
     # GPU phase
     # -------------------------------------------------------------------------
     gpu_rc=0
-    if (( RUN_GPU )); then
+    if (( RUN_GPU && !GPU_NOT_RUN )); then
         run_gpu_test
         gpu_rc=$?
         if [[ "$gpu_rc" -eq 0 ]]; then
@@ -1735,53 +1802,7 @@ main() {
         echo "GPU silicon-quality failure detected."
     fi
 
-    echo
-    echo "=============================================="
-    echo " TEST COMPLETE"
-    echo "=============================================="
-    echo
-
-    if (( RUN_CPU )); then
-        if [[ "$cpu_rc" -eq 0 ]]; then
-            echo "CPU result: PASS"
-            echo "  Tested: ${CPU_FREQ} MHz, scale ${CPU_START_SCALE} to ${CPU_MIN_SCALE} by ${CPU_STEP}"
-            echo "  Point duration: ${CPU_TEST_SECONDS}s; temperature limit: ${CPU_TEST_TEMP}C"
-            echo "  Last confirmed pass: ${CPU_LAST_PASS}"
-            echo "  Last confirmed pass current VID: ${CPU_LAST_PASS_VID} mV"
-            echo "  VID by scale: ${CPU_VID_HISTORY:-none}"
-        else
-            echo "CPU result: FAILED"
-            echo "  Tested: ${CPU_FREQ} MHz, scale ${CPU_START_SCALE} toward ${CPU_MIN_SCALE} by ${CPU_STEP}"
-            echo "  Point duration: ${CPU_TEST_SECONDS}s; temperature limit: ${CPU_TEST_TEMP}C"
-            echo "  Last confirmed pass: ${CPU_LAST_PASS}"
-            echo "  Last confirmed pass current VID: ${CPU_LAST_PASS_VID} mV"
-            echo "  VID by scale: ${CPU_VID_HISTORY:-none}"
-            echo "  Failure candidate: scale ${CPU_FAILURE_POINT}"
-            echo "  Failure reason: ${CPU_FAILURE_REASON:-see preceding CPU failure details}"
-            echo "  Result meaning: no conclusion below the last confirmed passing scale."
-        fi
-    fi
-
-    if (( RUN_GPU )); then
-        if [[ "$gpu_rc" -eq 0 ]]; then
-            echo "GPU result: PASS"
-            echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} to ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
-            echo "  Point duration: ${GPU_TEST_SECONDS}s; temperature limit: ${GPU_TEST_TEMP}C"
-            echo "  Last confirmed pass: ${GPU_LAST_PASS} mV"
-        else
-            echo "GPU result: FAILED"
-            echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} toward ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
-            echo "  Point duration: ${GPU_TEST_SECONDS}s; temperature limit: ${GPU_TEST_TEMP}C"
-            echo "  Last confirmed pass: ${GPU_LAST_PASS} mV"
-            echo "  Failure candidate: ${GPU_FAILURE_POINT} mV"
-            echo "  Failure reason: ${GPU_FAILURE_REASON:-see preceding GPU failure details}"
-            echo "  Result meaning: no conclusion below the last confirmed passing voltage."
-        fi
-    fi
-
-    echo
-    echo "No persistent CPU/GPU tuning configuration was modified."
-    echo "Interpret results as quick silicon-quality thresholds, not long-term stability certification."
+    show_test_report
 
     if [[ "$cpu_rc" -eq 0 && "$gpu_rc" -eq 0 ]]; then
         test_passed=1

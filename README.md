@@ -130,6 +130,8 @@ you reboot and rerun the script:
 - An interrupted CPU phase can be marked interrupted and continued directly
   with the GPU phase.
 - An interrupted GPU point is recorded as the GPU cutoff and is not retried.
+- Recovery prints the same final test report as a normal completion, including
+  the cutoff and last confirmed passing voltage before exiting.
 - Declining recovery returns to test selection without discarding saved state.
 
 Use the saved state display to confirm the phase, point, and last confirmed pass
