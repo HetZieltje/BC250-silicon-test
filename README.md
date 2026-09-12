@@ -18,8 +18,19 @@ failure or interruption according to the point at which it occurs.
 - `vkmark` for GPU testing
 - A working graphical or automatic Vulkan backend for `vkmark`
 
-The script does not install packages. Install missing dependencies separately
-before starting the test.
+If `stress-ng` or `vkmark` is missing, the script offers to install the
+missing packages. Installation is explicit and opt-in.
+
+On SteamOS, installation temporarily disables the read-only root filesystem,
+initializes/populates the pacman keyring, and runs:
+
+```bash
+pacman -Syu --noconfirm --needed stress-ng vkmark
+```
+
+The root filesystem is relocked afterward when `steamos-readonly` is
+available. Package installation changes the system package database and may
+perform a synchronized system upgrade; review the prompt before accepting it.
 
 ## Running
 
@@ -128,8 +139,10 @@ before choosing a recovery action.
 
 The script:
 
-- Does not install packages.
 - Does not modify the SteamOS root filesystem.
+- Does not install packages without explicit confirmation.
+- If package installation is accepted, temporarily unlocks SteamOS root,
+  initializes the pacman keyring, synchronizes packages, and relocks root.
 - Does not enable services at boot.
 - Does not write persistent CPU/GPU tuning configuration.
 - Temporarily stops conflicting CPU/GPU tuning services when necessary.

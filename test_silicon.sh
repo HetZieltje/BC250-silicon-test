@@ -600,6 +600,52 @@ show_previous_state() {
     return 0
 }
 
+install_missing_dependencies() {
+    local packages=("$@")
+    local readonly_disabled=0
+
+    echo
+    echo "The following packages are missing:"
+    printf '  %s\n' "${packages[@]}"
+    echo
+    echo "Installing them modifies the system package database and may modify"
+    echo "the SteamOS root filesystem temporarily. The filesystem will be relocked"
+    echo "afterward when steamos-readonly is available."
+
+    if ! confirm_yn "Install the missing packages with pacman -Syu now?"; then
+        die "Required test dependencies are missing."
+    fi
+
+    if command -v steamos-readonly >/dev/null 2>&1; then
+        steamos-readonly disable ||
+            die "Could not disable the SteamOS read-only filesystem."
+        readonly_disabled=1
+    fi
+
+    if command -v pacman-key >/dev/null 2>&1; then
+        pacman-key --init ||
+            {
+                (( readonly_disabled )) && steamos-readonly enable || true
+                die "pacman-key --init failed."
+            }
+        pacman-key --populate ||
+            {
+                (( readonly_disabled )) && steamos-readonly enable || true
+                die "pacman-key --populate failed."
+            }
+    fi
+
+    if ! pacman -Syu --noconfirm --needed "${packages[@]}"; then
+        (( readonly_disabled )) && steamos-readonly enable || true
+        die "Package installation failed."
+    fi
+
+    if (( readonly_disabled )); then
+        steamos-readonly enable ||
+            die "Packages were installed, but the SteamOS root filesystem could not be relocked."
+    fi
+}
+
 check_test_dependencies() {
     local missing=()
 
@@ -612,11 +658,13 @@ check_test_dependencies() {
 
     (( ${#missing[@]} == 0 )) && return 0
 
-    echo
-    echo "Missing required test dependencies:"
-    printf '  %s\n' "${missing[@]}"
-    echo "Install them before running this test; no packages are installed automatically."
-    die "Required test dependencies are missing."
+    install_missing_dependencies "${missing[@]}"
+
+    local package
+    for package in "${missing[@]}"; do
+        command -v "$package" >/dev/null 2>&1 ||
+            die "Package installation completed, but ${package} is still unavailable."
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -1598,7 +1646,8 @@ main() {
     echo "where the system hard-freezes/locks."
     echo "An unexpected stress/backend program exit during a test point is classified as a failed test point."
     echo
-    echo "No packages will be installed and the SteamOS root filesystem will not be modified."
+    echo "Missing stress-ng/vkmark packages can be installed on request with pacman -Syu."
+    echo "Package installation modifies the system and temporarily unlocks SteamOS root."
     echo "Nothing will be enabled at boot by this script."
     echo "CPU and GPU tuning are applied through their respective"
     echo "SMU backends with temporary runtime-only test state."
