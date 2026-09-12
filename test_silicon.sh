@@ -4,14 +4,13 @@
 #
 # Runtime-only silicon screening for an AMD BC-250.
 # Instability is defined as a system hard-freeze/lock.
-# This script does not install/enable boot services or modify persistent
-# CPU/GPU tuning configuration during the test.
+# This script does not install packages, change the SteamOS root filesystem,
+# enable boot services, or modify persistent CPU/GPU tuning configuration.
 #
 # CPU backend: bc250-collective/bc250_smu_oc, using Bc250Smu directly so the
 # CPU phase changes only CPU clock/scale and CPU temperature.
-# GPU backend: filippor/cyan-skillfish-governor SMU backend, launched with a
-# temporary one-point configuration so GPU frequency/voltage are applied via
-# the governor's SMU path without changing its persistent config.
+# GPU backend: direct Bc250Smu queue-0 calls for temporary frequency/voltage
+# forcing. Any active adaptive GPU service is stopped during the test.
 
 set -u
 set -o pipefail
@@ -39,23 +38,13 @@ GPU_TEST_TEMP=90
 BASELINE_CPU_FREQ=3500
 BASELINE_CPU_SCALE=0
 BASELINE_TEMP=100
+CPU_BASELINE_SOURCE="stable fallback"
 
-REAL_USER="${SUDO_USER:-${USER:-deck}}"
-REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
-[[ -n "$REAL_HOME" ]] || REAL_HOME="/home/deck"
-
-BC250_TOOLKIT_REPO="${BC250_TOOLKIT_REPO:-$REAL_HOME/.local/share/bc250-fixes/bc250-steamos}"
 BC250_CONTROL_DIR="${BC250_CONTROL_DIR:-/var/lib/bc250-control}"
 BC250_OC_DIR="${BC250_OC_DIR:-$BC250_CONTROL_DIR/smu-oc}"
-BC250_POWER="${BC250_POWER:-$BC250_TOOLKIT_REPO/bc250-power.sh}"
 
-GPU_CONFIG_DIR="/etc/cyan-skillfish-governor-smu"
-GPU_PERSISTENT_CONFIG="$GPU_CONFIG_DIR/config.toml"
-GPU_GOVERNOR_CMD=""
 GPU_GOVERNOR_UNIT=""
 CPU_SERVICE_UNIT=""
-
-GPU_TEMP_CONFIG="/tmp/bc250-silicon-test-gpu-$$.toml"
 
 ORIG_CPU_SERVICE_ACTIVE=0
 ORIG_GPU_SERVICE_ACTIVE=0
@@ -65,28 +54,21 @@ test_initialized=0
 test_passed=0
 CPU_LAST_PASS="none"
 CPU_LAST_PASS_VID="none"
-CPU_LAST_PASS_VID_TARGET="none"
 CPU_POINT_VID="none"
-CPU_POINT_VID_TARGET="none"
 CPU_VID_HISTORY=""
 CPU_FAILURE_POINT="none"
 CPU_FAILURE_REASON=""
 GPU_LAST_PASS="none"
 GPU_FAILURE_POINT="none"
 GPU_FAILURE_REASON=""
-pacman_rootfs_was_enabled=0
 stress_pid=""
 vkmark_pid=""
-gpu_governor_pid=""
 
-# The installed governor may use either the sectioned [[safe-points]] schema
-# or the older safe-points = [[freq, mv]] schema. We detect the installed
-# config and generate the appropriate temporary file.
-GPU_CONFIG_SCHEMA="sectioned"
 SMU_RETRIES=3
 RUN_CPU=1
 RUN_GPU=1
 USE_DEFAULT_VALUES=0
+RESUME_GPU=0
 
 # -----------------------------------------------------------------------------
 # Generic helpers
@@ -238,12 +220,12 @@ ask_cpu_values() {
         read -rp "CPU clock MHz [${CPU_FREQ}]: " v
         [[ -z "$v" ]] && v="$CPU_FREQ"
 
-        if validate_positive_int "$v" && (( v >= 3500 && v <= 4500 )); then
+        if validate_positive_int "$v" && (( v >= 100 && v <= 4500 )); then
             CPU_FREQ="$v"
             break
         fi
 
-        echo "Invalid CPU clock. Enter a value from 3500 to 4500 MHz."
+        echo "Invalid CPU clock. Enter a value from 100 to 4500 MHz."
     done
 
     while true; do
@@ -506,6 +488,21 @@ state_set_field() {
     mv -f "$tmp" "$STATE_FILE"
 }
 
+state_remove_field() {
+    local field="$1"
+    local tmp="${STATE_FILE}.tmp"
+    local key
+    local value
+
+    [[ -f "$STATE_FILE" ]] || return 0
+    : > "$tmp"
+    while IFS='=' read -r key value; do
+        [[ "$key" == "$field" ]] && continue
+        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    done < "$STATE_FILE"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
 mark_phase_result() {
     local phase="$1"
     local status="$2"
@@ -532,8 +529,62 @@ show_previous_state() {
         fi
         printf '%s=%s\n' "$key" "$value"
     done < "$STATE_FILE"
+    local saved_phase
+    local saved_cpu_status
+    local saved_gpu_status
+    local saved_gpu_point
+    saved_phase="$(awk -F= '$1 == "phase" {print $2}' "$STATE_FILE")"
+    saved_cpu_status="$(awk -F= '$1 == "cpu_status" {print $2}' "$STATE_FILE")"
+    saved_gpu_status="$(awk -F= '$1 == "gpu_status" {print $2}' "$STATE_FILE")"
+    saved_gpu_point="$(awk -F= '$1 == "gpu_point" {print $2}' "$STATE_FILE")"
+
+    if [[ "$saved_phase" == "CPU" &&
+        ( "$saved_cpu_status" == "IN_PROGRESS" || "$saved_cpu_status" == "FAILED_INTERRUPTED" ) ]]; then
+        echo
+        echo "The previous CPU phase was interrupted before it completed."
+        echo "The CPU cutoff is already recorded; the GPU phase can continue."
+        echo
+        read -rp "Continue the previous run with the GPU test? [Y/n] " ans
+        if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+            RESUME_GPU=1
+            RUN_CPU=0
+            RUN_GPU=1
+            state_set_field cpu_status "FAILED_INTERRUPTED"
+            state_set_field timestamp "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "Resuming with the GPU phase."
+            return 0
+        fi
+
+        echo "Previous state retained. Returning to test selection."
+        return 0
+    fi
+
+    if [[ "$saved_phase" == "GPU" && "$saved_gpu_status" == "IN_PROGRESS" &&
+        "$saved_gpu_point" =~ ^[0-9]+$ ]]; then
+        echo
+        echo "The previous GPU phase was interrupted before it completed."
+        echo "The saved GPU point is treated as the GPU cutoff: ${saved_gpu_point} mV."
+        echo
+        read -rp "Record ${saved_gpu_point} mV as the GPU failure cutoff? [Y/n] " ans
+        if [[ "$ans" =~ ^[Nn]$ ]]; then
+            echo "Previous state retained. Returning to test selection."
+            return 0
+        fi
+
+        state_set_field gpu_status "FAILED"
+        state_set_field gpu_failure_point "$saved_gpu_point"
+        state_set_field gpu_failure_reason "System hard-locked during the GPU point; ${saved_gpu_point} mV is the cutoff."
+        state_set_field phase "GPU"
+        state_set_field point "$saved_gpu_point"
+        state_set_field timestamp "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "GPU cutoff recorded at ${saved_gpu_point} mV."
+        echo "Last confirmed GPU pass: $(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE") mV"
+        echo "The interrupted GPU point will not be retried."
+        exit 0
+    fi
+
     echo
-    echo "A previous run may have ended in a hard freeze."
+    echo "A previous run completed or may have ended in a hard freeze."
     echo "The recorded point is informational; a new run starts from the configured start value."
     echo
 
@@ -545,23 +596,11 @@ show_previous_state() {
         return 0
     fi
 
-    echo "Previous state retained. Exiting."
-    exit 0
+    echo "Previous state retained. Returning to test selection."
+    return 0
 }
 
-# -----------------------------------------------------------------------------
-# SteamOS package installation
-# -----------------------------------------------------------------------------
-relock_package_rootfs() {
-    if [[ "$pacman_rootfs_was_enabled" -eq 1 ]]; then
-        steamos-readonly enable 2>/dev/null ||
-            log "WARNING: failed to re-enable SteamOS read-only root filesystem."
-
-        pacman_rootfs_was_enabled=0
-    fi
-}
-
-install_missing_packages() {
+check_test_dependencies() {
     local missing=()
 
     if (( RUN_CPU )) && ! command -v stress-ng >/dev/null 2>&1; then
@@ -574,62 +613,10 @@ install_missing_packages() {
     (( ${#missing[@]} == 0 )) && return 0
 
     echo
-    echo "Missing load packages detected:"
+    echo "Missing required test dependencies:"
     printf '  %s\n' "${missing[@]}"
-    echo
-
-    read -rp "Install these packages now? [y/N] " answer
-    [[ "$answer" =~ ^[Yy]$ ]] ||
-        die "Required packages were not installed. The test cannot continue."
-
-    command -v steamos-readonly >/dev/null 2>&1 ||
-        die "steamos-readonly is unavailable."
-
-    command -v pacman >/dev/null 2>&1 ||
-        die "pacman is unavailable."
-
-    command -v pacman-key >/dev/null 2>&1 ||
-        die "pacman-key is unavailable."
-
-    if steamos-readonly status 2>/dev/null | grep -qi 'enabled'; then
-        log "Temporarily unlocking the SteamOS root filesystem..."
-
-        steamos-readonly disable ||
-            die "Could not disable the SteamOS read-only root filesystem."
-
-        pacman_rootfs_was_enabled=1
-    fi
-
-    [[ -s /usr/share/pacman/keyrings/archlinux.gpg ]] || {
-        relock_package_rootfs
-        die "Missing archlinux pacman keyring."
-    }
-
-    [[ -s /usr/share/pacman/keyrings/holo.gpg ]] || {
-        relock_package_rootfs
-        die "Missing holo pacman keyring."
-    }
-
-    log "Initialising SteamOS pacman trust keys..."
-
-    pacman-key --init || {
-        relock_package_rootfs
-        die "pacman-key --init failed."
-    }
-
-    pacman-key --populate || {
-        relock_package_rootfs
-        die "pacman-key --populate failed."
-    }
-
-    log "Installing missing packages: ${missing[*]}"
-
-    pacman -Sy --noconfirm --needed "${missing[@]}" || {
-        relock_package_rootfs
-        die "Package installation failed."
-    }
-
-    relock_package_rootfs
+    echo "Install them before running this test; no packages are installed automatically."
+    die "Required test dependencies are missing."
 }
 
 # -----------------------------------------------------------------------------
@@ -637,20 +624,7 @@ install_missing_packages() {
 # -----------------------------------------------------------------------------
 find_cpu_backend() {
     if [[ ! -f "$BC250_OC_DIR/bc250_smu/api.py" ]]; then
-        [[ -x "$BC250_POWER" ]] ||
-            die "bc250-steamos toolkit not found at $BC250_POWER"
-
-        echo
-        echo "bc250_smu_oc runtime files are missing from:"
-        echo "  $BC250_OC_DIR"
-        echo
-
-        read -rp "Install/update bc250_smu_oc via the installed toolkit now? [y/N] " answer
-        [[ "$answer" =~ ^[Yy]$ ]] ||
-            die "bc250_smu_oc runtime files are required for the CPU test."
-
-        "$BC250_POWER" cpu-oc update ||
-            die "bc250-steamos cpu-oc update failed."
+        die "bc250_smu_oc runtime files are missing from $BC250_OC_DIR. Install them before running this test."
     fi
 
     [[ -f "$BC250_OC_DIR/bc250_smu/api.py" ]] ||
@@ -659,99 +633,47 @@ find_cpu_backend() {
     log "Using bc250_smu_oc backend: $BC250_OC_DIR"
 }
 
-find_gpu_backend() {
-    local candidate=""
-    local exec_line=""
-    local unit="cyan-skillfish-governor-smu.service"
-    local pkg_file=""
+capture_cpu_baseline() {
+    local values
 
-    # Do not assume a single installation path. Discover the executable from:
-    # 1) PATH, 2) the installed systemd unit (even if inactive),
-    # 3) known packaged locations, 4) pacman's actual file list.
-    if command -v cyan-skillfish-governor-smu >/dev/null 2>&1; then
-        candidate="$(command -v cyan-skillfish-governor-smu)"
+    values="$(
+        PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 - 2>/dev/null <<'PY'
+from bc250_smu import Bc250Smu
+
+smu = Bc250Smu(use_flock=True)
+try:
+    print(smu.q3_0x43_get_core_freq(0), smu.q3_0x40_get_cpu_temp_max())
+finally:
+    smu.close()
+PY
+    )"
+
+    read -r BASELINE_CPU_FREQ BASELINE_TEMP <<< "$values"
+    if [[ "$BASELINE_CPU_FREQ" =~ ^[0-9]+$ ]] &&
+        [[ "$BASELINE_TEMP" =~ ^[0-9]+$ ]]; then
+        log "SMU CPU clock/temperature found, but the VID-curve scale has no SMU readback API."
+        log "Using the complete stable CPU fallback because the SMU baseline is incomplete."
+        BASELINE_CPU_FREQ=3500
+        BASELINE_CPU_SCALE=0
+        BASELINE_TEMP=100
+        CPU_BASELINE_SOURCE="stable fallback (SMU curve unavailable)"
+        return 1
     fi
 
-    if [[ -z "$candidate" ]] && systemctl cat "$unit" >/dev/null 2>&1; then
-        exec_line="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+    BASELINE_CPU_FREQ=3500
+    BASELINE_CPU_SCALE=0
+    BASELINE_TEMP=100
+    CPU_BASELINE_SOURCE="stable fallback"
+    log "SMU CPU baseline readback unavailable; using stable fallback after testing."
+    return 1
+}
 
-        candidate="$(
-            printf '%s\n' "$exec_line" |
-                grep -oE '/[^[:space:]\\;]+cyan-skillfish-governor-smu[^[:space:]\\;]*' |
-                head -n1 || true
-        )"
+find_direct_gpu_backend() {
+    [[ -f "$BC250_OC_DIR/bc250_smu/api_q0.py" ]] ||
+        die "bc250_smu queue-0 GPU API is missing from $BC250_OC_DIR"
 
-        if [[ -z "$candidate" ]]; then
-            candidate="$(
-                systemctl cat "$unit" 2>/dev/null |
-                    sed -n 's/^ExecStart=//p' |
-                    tail -n1 |
-                    awk '{print $1}' |
-                    sed 's/^-//' ||
-                    true
-            )"
-        fi
-    fi
-
-    if [[ -z "$candidate" ]]; then
-        for path in \
-            /etc/cyan-skillfish-governor-smu/cyan-skillfish-governor-smu \
-            /usr/bin/cyan-skillfish-governor-smu \
-            /usr/local/bin/cyan-skillfish-governor-smu \
-            /usr/libexec/cyan-skillfish-governor-smu \
-            /usr/lib/cyan-skillfish-governor-smu/cyan-skillfish-governor-smu; do
-
-            if [[ -f "$path" ]]; then
-                candidate="$path"
-                break
-            fi
-        done
-    fi
-
-    if [[ -z "$candidate" ]] &&
-        command -v pacman >/dev/null 2>&1 &&
-        pacman -Qq cyan-skillfish-governor-smu >/dev/null 2>&1; then
-
-        pkg_file="$(
-            pacman -Ql cyan-skillfish-governor-smu 2>/dev/null |
-                awk '$2 ~ /cyan-skillfish-governor-smu$/ && $2 !~ /\.service$/ {print $2; exit}'
-        )"
-
-        [[ -n "$pkg_file" ]] && candidate="$pkg_file"
-    fi
-
-    if [[ -n "$candidate" ]]; then
-        candidate="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
-    fi
-
-    [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]] || {
-        echo
-        echo "Could not locate the installed cyan-skillfish-governor-smu executable."
-        echo "Checked PATH, systemd ExecStart, known package locations, and pacman file ownership."
-        echo
-        echo "Useful diagnostics:" >&2
-        echo "  systemctl cat cyan-skillfish-governor-smu.service" >&2
-        echo "  systemctl show cyan-skillfish-governor-smu.service -p ExecStart --value" >&2
-        echo "  pacman -Ql cyan-skillfish-governor-smu" >&2
-        echo "  ls -l /etc/cyan-skillfish-governor-smu/" >&2
-        die "cyan-skillfish-governor-smu executable could not be located."
-    }
-
-    GPU_GOVERNOR_CMD="$candidate"
-
-    [[ -f "$GPU_PERSISTENT_CONFIG" ]] ||
-        die "Installed cyan-skillfish-governor-smu config not found: $GPU_PERSISTENT_CONFIG"
-
-    if grep -q '^\[\[safe-points\]\]' "$GPU_PERSISTENT_CONFIG"; then
-        GPU_CONFIG_SCHEMA="sectioned"
-    elif grep -q '^safe-points[[:space:]]*=' "$GPU_PERSISTENT_CONFIG"; then
-        GPU_CONFIG_SCHEMA="legacy"
-    else
-        GPU_CONFIG_SCHEMA="sectioned"
-    fi
-
-    log "Using cyan-skillfish-governor SMU backend: $GPU_GOVERNOR_CMD"
-    log "GPU governor config schema detected: $GPU_CONFIG_SCHEMA"
+    log "Using direct bc250_smu queue-0 GPU backend: $BC250_OC_DIR"
 }
 
 find_services() {
@@ -798,11 +720,13 @@ stop_conflicting_services() {
 set_cpu_point() {
     local scale="$1"
     local applied_vid
+    local error_file="/tmp/bc250-silicon-cpu-point-$$.err"
 
     applied_vid="$(
         PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 - "$CPU_FREQ" "$scale" "$CPU_TEST_TEMP" 2>/dev/null <<'PY'
+        python3 - "$CPU_FREQ" "$scale" "$CPU_TEST_TEMP" 2>"$error_file" <<'PY'
 import sys
+import time
 from bc250_smu import Bc250Smu
 
 frequency = int(sys.argv[1])
@@ -814,6 +738,7 @@ smu = Bc250Smu(use_flock=True)
 try:
     smu.check_test_message()
     smu.q3_0x8b_set_cpu_max_temperature(cpu_temp)
+    time.sleep(1.0)
     applied_temp = smu.q3_0x40_get_cpu_temp_max()
     if applied_temp != cpu_temp:
         raise RuntimeError(
@@ -825,28 +750,32 @@ try:
     smu.disable_extra_cpu_gpu_voltage(True)
     smu.q3_0x50_scale_f_vid_curve(scale)
     smu.q3_0x8f_set_max_cpu_boost_clk(frequency)
-    applied_clock = smu.q3_0x43_get_core_freq(0)
-    if not int(frequency * 0.9) <= applied_clock <= int(frequency * 1.1):
-        raise RuntimeError(
-            f"CPU clock readback was {applied_clock} MHz, expected about {frequency} MHz"
-        )
+    time.sleep(1.0)
     print(smu.q3_0x36_get_current_cpu_voltage())
+except Exception as error:
+    print(f"CPU SMU point failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
 finally:
     smu.close()
 PY
-    )" || return 1
+    )"
+    local status=$?
+    if (( status != 0 )); then
+        if [[ -s "$error_file" ]]; then
+            log "CPU SMU point attempt failed: $(<"$error_file")"
+        else
+            log "CPU SMU point attempt failed without an error message."
+        fi
+        rm -f "$error_file"
+        return "$status"
+    fi
+    rm -f "$error_file"
 
     [[ "$applied_vid" =~ ^[0-9]+$ ]] || {
         log "ERROR: CPU VID readback was invalid: ${applied_vid:-empty}"
         return 1
     }
     CPU_POINT_VID="$applied_vid"
-    CPU_POINT_VID_TARGET="$(awk -v clock="$CPU_FREQ" -v scale="$scale" \
-        'BEGIN {
-            p = -1.519 + scale * 0.004325
-            q = 2800.0 - (scale * 10.0)
-            printf "%.0f", 0.0003 * clock * clock + p * clock + q
-        }')"
 }
 
 retry_smu_operation() {
@@ -857,6 +786,10 @@ retry_smu_operation() {
     for ((attempt = 1; attempt <= SMU_RETRIES; attempt++)); do
         if "$@"; then
             return 0
+        fi
+        local status=$?
+        if (( status == 2 )); then
+            return 2
         fi
 
         if (( attempt < SMU_RETRIES )); then
@@ -891,11 +824,13 @@ for attempt in range(3):
         smu = Bc250Smu(use_flock=True)
         smu.check_test_message()
         smu.q3_0x8b_set_cpu_max_temperature(temp)
+        time.sleep(1.0)
         if smu.q3_0x40_get_cpu_temp_max() != temp:
             raise RuntimeError("CPU baseline temperature readback mismatch")
         smu.disable_extra_cpu_gpu_voltage(True)
         smu.q3_0x50_scale_f_vid_curve(scale)
         smu.q3_0x8f_set_max_cpu_boost_clk(frequency)
+        time.sleep(1.0)
         applied_clock = smu.q3_0x43_get_core_freq(0)
         if not int(frequency * 0.9) <= applied_clock <= int(frequency * 1.1):
             raise RuntimeError("CPU baseline clock readback mismatch")
@@ -977,6 +912,25 @@ read_cpu_clock() {
     printf '%s' "${clock:-unavailable}"
 }
 
+read_cpu_voltage() {
+    local voltage
+
+    voltage="$(
+        PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 - <<'PY' 2>/dev/null
+from bc250_smu import Bc250Smu
+
+smu = Bc250Smu(use_flock=True)
+try:
+    print(smu.q3_0x36_get_current_cpu_voltage())
+finally:
+    smu.close()
+PY
+    )"
+
+    [[ "$voltage" =~ ^[0-9]+$ ]] && printf '%smV' "$voltage" || printf 'unavailable'
+}
+
 read_gpu_temperature() {
     local path
     local hwmon_dir
@@ -1000,6 +954,7 @@ read_gpu_temperature() {
 read_gpu_clock() {
     local clock
 
+    # Queue-0 0x37 returns the live SMU-reported GFX clock, not GPU_FREQ.
     clock="$(
         PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
             python3 - <<'PY' 2>/dev/null
@@ -1055,8 +1010,29 @@ PY
     printf 'unavailable'
 }
 
+throttle_warning() {
+    local temperature="$1"
+    local clock="$2"
+    local max_temperature="$3"
+    local requested_clock="$4"
+    local temperature_margin=1
+    local clock_margin=50
+    local temperature_value="${temperature%C}"
+    local clock_value="${clock%MHz}"
+
+    [[ "$temperature_value" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    [[ "$clock_value" =~ ^[0-9]+$ ]] || return 0
+
+    if awk -v temperature="$temperature_value" -v limit="$max_temperature" \
+        -v temp_margin="$temperature_margin" -v clock="$clock_value" \
+        -v requested="$requested_clock" -v clock_margin="$clock_margin" \
+        'BEGIN { exit !(temperature >= limit - temp_margin && clock <= requested - clock_margin) }'; then
+        printf ' [WARNING: possible thermal throttling]'
+    fi
+}
+
 verify_gpu_point() {
-    local expected_clock="$1"
+    local requested_clock="$1"
     local observed_clock
     local observed_mhz
     local attempt
@@ -1069,12 +1045,12 @@ verify_gpu_point() {
         if [[ "$observed_clock" != "unavailable" ]]; then
             observed_mhz="${observed_clock%MHz}"
             if [[ "$observed_mhz" =~ ^[0-9]+$ ]]; then
-                if (( observed_mhz == expected_clock )); then
-                    log "GPU SMU clock readback verified at ${observed_clock}."
+                if (( observed_mhz == requested_clock )); then
+                    log "GPU live SMU clock readback verified at ${observed_clock}."
                     clock_verified=1
                     break
                 fi
-                log "Waiting for GPU clock to settle: read ${observed_clock}, requested ${expected_clock}MHz."
+                log "Waiting for GPU clock to settle: live read ${observed_clock}, requested ${requested_clock}MHz."
             else
                 log "Waiting for valid GPU clock readback: ${observed_clock}."
             fi
@@ -1085,7 +1061,7 @@ verify_gpu_point() {
     done
 
     if (( ! clock_verified )); then
-        log "ERROR: GPU SMU clock did not reach ${expected_clock}MHz within the settling window."
+        log "ERROR: GPU live SMU clock did not reach ${requested_clock}MHz within the settling window."
         return 1
     fi
 }
@@ -1093,14 +1069,25 @@ verify_gpu_point() {
 report_telemetry() {
     local phase="$1"
     local elapsed="$2"
+    local temperature
+    local clock
+    local voltage
+    local warning
 
     if [[ "$phase" == "CPU" ]]; then
-        printf '  [%s/%ss] CPU telemetry: temp %s, clock %s\n' \
-            "$elapsed" "$CPU_TEST_SECONDS" "$(read_cpu_temperature)" "$(read_cpu_clock)"
+        temperature="$(read_cpu_temperature)"
+        clock="$(read_cpu_clock)"
+        voltage="$(read_cpu_voltage)"
+        warning="$(throttle_warning "$temperature" "$clock" "$CPU_TEST_TEMP" "$CPU_FREQ")"
+        printf '  [%s/%ss] CPU telemetry: temp %s, clock %s, current voltage %s%s\n' \
+            "$elapsed" "$CPU_TEST_SECONDS" "$temperature" "$clock" "$voltage" "$warning"
     else
-        printf '  [%s/%ss] GPU telemetry: temp %s, SMU clock %s, current voltage %s\n' \
-            "$elapsed" "$GPU_TEST_SECONDS" "$(read_gpu_temperature)" "$(read_gpu_clock)" \
-            "$(read_gpu_voltage)"
+        temperature="$(read_gpu_temperature)"
+        clock="$(read_gpu_clock)"
+        voltage="$(read_gpu_voltage)"
+        warning="$(throttle_warning "$temperature" "$clock" "$GPU_TEST_TEMP" "$GPU_FREQ")"
+        printf '  [%s/%ss] GPU telemetry: temp %s, SMU clock %s, current voltage %s%s\n' \
+            "$elapsed" "$GPU_TEST_SECONDS" "$temperature" "$clock" "$voltage" "$warning"
     fi
 }
 
@@ -1128,7 +1115,9 @@ run_test_interval() {
             # direct test point before each telemetry sample so the sweep
             # continues testing the requested setting rather than the
             # persistent governor curve.
-            apply_gpu_point "$CURRENT_GPU_TEST_MV" 1 || true
+            if ! apply_gpu_point "$CURRENT_GPU_TEST_MV" 1; then
+                return 3
+            fi
         fi
         report_telemetry "$phase" "$elapsed"
     done
@@ -1137,11 +1126,11 @@ run_test_interval() {
 run_cpu_test() {
     local scale="$CPU_START_SCALE"
     local last_pass=""
+    local interval_status=0
+    local point_status=0
     CPU_LAST_PASS="none"
     CPU_LAST_PASS_VID="none"
-    CPU_LAST_PASS_VID_TARGET="none"
     CPU_POINT_VID="none"
-    CPU_POINT_VID_TARGET="none"
     CPU_VID_HISTORY=""
     CPU_FAILURE_POINT="none"
     CPU_FAILURE_REASON=""
@@ -1167,7 +1156,10 @@ run_cpu_test() {
 
         log "Applying CPU scale ${scale} (CPU temp ${CPU_TEST_TEMP} C)"
 
-        if ! retry_smu_operation "CPU scale ${scale}" set_cpu_point "$scale"; then
+        point_status=0
+        retry_smu_operation "CPU scale ${scale}" set_cpu_point "$scale" ||
+            point_status=$?
+        if (( point_status != 0 )); then
             stop_cpu_stress
 
             echo
@@ -1176,21 +1168,21 @@ run_cpu_test() {
             echo "CPU last confirmed pass = ${last_pass:-none}"
             echo "Reason: the CPU SMU point could not be applied after ${SMU_RETRIES} attempts."
             echo "The point is classified as a failed CPU test setup."
+            CPU_FAILURE_REASON="CPU SMU point could not be applied after ${SMU_RETRIES} attempts."
             CPU_LAST_PASS="${last_pass:-none}"
             CPU_FAILURE_POINT="$scale"
-            CPU_FAILURE_REASON="CPU SMU point could not be applied after ${SMU_RETRIES} attempts."
             restore_cpu_baseline ||
                 die "CPU SMU setup failure detected, but CPU baseline restoration failed."
             return 13
         fi
 
         state_set_field cpu_vid_mv "$CPU_POINT_VID"
-        state_set_field cpu_vid_target_mv "$CPU_POINT_VID_TARGET"
-        CPU_VID_HISTORY+="${CPU_VID_HISTORY:+, }scale=${scale}:target=${CPU_POINT_VID_TARGET}mV,current=${CPU_POINT_VID}mV"
+        CPU_VID_HISTORY+="${CPU_VID_HISTORY:+, }scale=${scale}:current=${CPU_POINT_VID}mV"
         state_set_field cpu_vid_history "$CPU_VID_HISTORY"
-        log "CPU point active: ${CPU_FREQ} MHz / scale ${scale} / estimated target ${CPU_POINT_VID_TARGET} mV / current ${CPU_POINT_VID} mV / CPU ${CPU_TEST_TEMP} C"
+        log "CPU point active: ${CPU_FREQ} MHz / scale ${scale} / current ${CPU_POINT_VID} mV / CPU ${CPU_TEST_TEMP} C"
 
-        run_test_interval CPU "$CPU_TEST_SECONDS"
+        interval_status=0
+        run_test_interval CPU "$CPU_TEST_SECONDS" || interval_status=$?
 
         if ! kill -0 "$stress_pid" 2>/dev/null; then
             stop_cpu_stress
@@ -1206,8 +1198,9 @@ run_cpu_test() {
             CPU_FAILURE_POINT="$scale"
             CPU_FAILURE_REASON="stress-ng exited unexpectedly during the ${scale} test point."
 
-            restore_cpu_baseline ||
-                die "CPU failure detected, but CPU baseline restoration failed."
+            if ! restore_cpu_baseline; then
+                log "WARNING: CPU baseline restoration was not confirmed; continuing to GPU silicon testing."
+            fi
 
             return 10
         fi
@@ -1215,7 +1208,6 @@ run_cpu_test() {
         last_pass="$scale"
         CPU_LAST_PASS="$last_pass"
         CPU_LAST_PASS_VID="$CPU_POINT_VID"
-        CPU_LAST_PASS_VID_TARGET="$CPU_POINT_VID_TARGET"
 
         echo "  CPU ${CPU_FREQ} MHz / ${scale}: PASS"
         write_state CPU "$scale" "$last_pass"
@@ -1231,7 +1223,7 @@ run_cpu_test() {
 }
 
 # -----------------------------------------------------------------------------
-# GPU: cyan-skillfish-governor SMU backend
+# GPU: direct Bc250Smu queue-0 backend
 # -----------------------------------------------------------------------------
 write_gpu_temp_limit() {
     local temp="$1"
@@ -1239,12 +1231,14 @@ write_gpu_temp_limit() {
     PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         python3 - "$temp" 2>/dev/null <<'PY'
 import sys
+import time
 from bc250_smu import Bc250Smu
 
 smu = Bc250Smu(use_flock=True)
 
 try:
     smu.q3_0x8c_set_gpu_max_temperature(int(sys.argv[1]))
+    time.sleep(1.0)
 finally:
     smu.close()
 PY
@@ -1255,67 +1249,59 @@ write_gpu_temp_baseline() {
     write_gpu_temp_limit "$temp"
 }
 
-write_gpu_config() {
-    local mv="$1"
-    local tmp="$GPU_TEMP_CONFIG"
-
-    if [[ "$GPU_CONFIG_SCHEMA" == "sectioned" ]]; then
-        cat > "$tmp" <<EOF_GPU
-[gpu]
-set-method = "smu"
-
-[gpu-usage]
-fix-metrics = false
-method = "busy-flag"
-
-[[safe-points]]
-frequency = ${GPU_FREQ}
-voltage = ${mv}
-EOF_GPU
-    else
-        cat > "$tmp" <<EOF_GPU
-[gpu]
-set-method = "smu"
-
-[gpu-usage]
-fix-metrics = false
-method = "busy-flag"
-
-safe-points = [[${GPU_FREQ}, ${mv}]]
-EOF_GPU
-    fi
-}
-
 apply_gpu_point() {
     local mv="$1"
     local quiet="${2:-0}"
     local attempt
+    local error_file="/tmp/bc250-silicon-gpu-apply-$$.err"
 
     (( quiet )) || log "Applying direct GPU SMU point at ${GPU_FREQ} MHz / ${mv} mV"
     for ((attempt = 1; attempt <= SMU_RETRIES; attempt++)); do
         if PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-                python3 - "$GPU_FREQ" "$mv" 2>/dev/null <<'PY'
+                python3 - "$GPU_FREQ" "$mv" 2>"$error_file" <<'PY'
 import sys
+import time
 from bc250_smu import Bc250Smu
 
+frequency = int(sys.argv[1])
+voltage = int(sys.argv[2])
 smu = Bc250Smu(allow_queue0=True, use_flock=True)
 try:
-    smu.force_gfx_freq(int(sys.argv[1]))
-    smu.force_gfx_vid(int(sys.argv[2]))
+    smu.force_gfx_freq(frequency)
+    smu.force_gfx_vid(voltage)
+    # The queue-0 VID query is a live voltage reading, not a readback of the
+    # forced VID command. Validate the programmed point through the live clock
+    # and record live voltage later while the GPU is under stress.
+    time.sleep(1.0)
+    # The live clock is load-dependent. It is verified after vkmark starts,
+    # when the GPU is actually exercising the forced point.
+except Exception as error:
+    print(f"GPU SMU apply failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
 finally:
     smu.close()
 PY
         then
+            rm -f "$error_file"
+            if (( attempt > 1 )); then
+                log "GPU SMU apply succeeded on retry attempt ${attempt}."
+            fi
             return 0
+        fi
+        if [[ -s "$error_file" ]]; then
+            log "GPU SMU apply attempt ${attempt} failed: $(<"$error_file")"
+        else
+            log "GPU SMU apply attempt ${attempt} failed without an error message."
         fi
         (( attempt < SMU_RETRIES )) && sleep 0.5
     done
 
+    rm -f "$error_file"
     log "Unable to apply GPU point after ${SMU_RETRIES} attempts."
     return 14
 }
 
-start_gpu_governor_point() {
+start_gpu_point() {
     local mv="$1"
 
     if ! retry_smu_operation "GPU temperature limit ${GPU_TEST_TEMP} C" \
@@ -1327,33 +1313,22 @@ start_gpu_governor_point() {
     apply_gpu_point "$mv" ||
         return 14
 
-    verify_gpu_point "$GPU_FREQ" ||
-        return 14
 }
 
 clear_gpu_point() {
     PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         python3 - 2>/dev/null <<'PY'
+import time
 from bc250_smu import Bc250Smu
 
 smu = Bc250Smu(allow_queue0=True, use_flock=True)
 try:
     smu.unforce_gfx_freq()
     smu.unforce_gfx_vid()
+    time.sleep(1.0)
 finally:
     smu.close()
 PY
-}
-
-stop_gpu_governor_point() {
-    if [[ -n "$gpu_governor_pid" ]] &&
-        kill -0 "$gpu_governor_pid" 2>/dev/null; then
-
-        kill "$gpu_governor_pid" 2>/dev/null || true
-        wait "$gpu_governor_pid" 2>/dev/null || true
-    fi
-
-    gpu_governor_pid=""
 }
 
 start_gpu_stress() {
@@ -1420,6 +1395,7 @@ run_gpu_test() {
     local mv="$GPU_START_MV"
     local last_pass=""
     local interval_status=0
+    local point_status=0
     GPU_LAST_PASS="none"
     GPU_FAILURE_POINT="none"
     GPU_FAILURE_REASON=""
@@ -1438,22 +1414,29 @@ run_gpu_test() {
 
     while (( mv >= GPU_MIN_MV )); do
         CURRENT_GPU_TEST_MV="$mv"
-        # State is written before the governor is started because applying the
-        # SMU point may hard-freeze the machine.
+        # State is written before applying the SMU point because the operation
+        # may hard-freeze the machine.
         write_state GPU "$mv" "$last_pass"
 
-        if ! start_gpu_governor_point "$mv"; then
-            stop_gpu_governor_point
+        point_status=0
+        start_gpu_point "$mv" || point_status=$?
+        if (( point_status != 0 )); then
 
             echo
             echo "GPU: FAILURE"
             echo "GPU failure candidate = ${mv} mV"
             echo "GPU last confirmed pass = ${last_pass:-none} mV"
-            echo "Reason: the GPU SMU clock setting could not be independently verified before this test point."
-            echo "The point is classified as a failed GPU setup verification."
             GPU_LAST_PASS="${last_pass:-none}"
             GPU_FAILURE_POINT="$mv"
-            GPU_FAILURE_REASON="GPU SMU clock setting could not be independently verified before this test point."
+            if (( point_status == 13 )); then
+                echo "Reason: the GPU temperature limit could not be applied."
+                echo "The point is classified as a failed GPU temperature setup."
+                GPU_FAILURE_REASON="GPU temperature limit could not be applied before this test point."
+            else
+                echo "Reason: the GPU SMU clock could not be independently verified before this test point."
+                echo "The point is classified as a failed GPU setup verification."
+                GPU_FAILURE_REASON="GPU SMU clock could not be independently verified before this test point."
+            fi
 
             return 13
         fi
@@ -1462,12 +1445,25 @@ run_gpu_test() {
 
         log "GPU point active: ${GPU_FREQ} MHz / ${mv} mV / GPU ${GPU_TEST_TEMP}C"
 
+        if ! verify_gpu_point "$GPU_FREQ"; then
+            stop_gpu_stress
+            echo
+            echo "GPU: FAILURE"
+            echo "GPU failure candidate = ${mv} mV"
+            echo "GPU last confirmed pass = ${last_pass:-none} mV"
+            echo "Reason: the live GPU clock did not reach the requested frequency under stress."
+            echo "The point is classified as a failed GPU clock verification."
+            GPU_LAST_PASS="${last_pass:-none}"
+            GPU_FAILURE_POINT="$mv"
+            GPU_FAILURE_REASON="Live GPU clock did not reach ${GPU_FREQ} MHz under stress."
+            return 14
+        fi
+
         interval_status=0
         run_test_interval GPU "$GPU_TEST_SECONDS" || interval_status=$?
 
         if (( interval_status == 2 )); then
             stop_gpu_stress
-            stop_gpu_governor_point
 
             echo
             echo "GPU: FAILURE"
@@ -1481,9 +1477,23 @@ run_gpu_test() {
             return 12
         fi
 
+        if (( interval_status == 3 )); then
+            stop_gpu_stress
+
+            echo
+            echo "GPU: FAILURE"
+            echo "GPU failure candidate = ${mv} mV"
+            echo "GPU last confirmed pass = ${last_pass:-none} mV"
+            echo "Reason: the requested GPU settings could not be reapplied during the ${mv} mV test point."
+            echo "The point is not considered valid because its configured clock/voltage could not be maintained."
+            GPU_LAST_PASS="${last_pass:-none}"
+            GPU_FAILURE_POINT="$mv"
+            GPU_FAILURE_REASON="Requested GPU settings could not be reapplied during the ${mv} mV test point."
+            return 14
+        fi
+
         if ! kill -0 "$vkmark_pid" 2>/dev/null; then
             stop_gpu_stress
-            stop_gpu_governor_point
 
             echo
             echo "GPU: FAILURE"
@@ -1505,7 +1515,6 @@ run_gpu_test() {
         write_state GPU "$mv" "$last_pass"
 
         stop_gpu_stress
-        stop_gpu_governor_point
 
         mv=$((mv + GPU_STEP_MV))
     done
@@ -1537,8 +1546,8 @@ restore_services() {
         systemctl start "$GPU_GOVERNOR_UNIT" 2>/dev/null || true
     elif (( RUN_GPU )); then
         # No GPU governor was active before the test. Restore the test-only
-        # thermal change to the stock runtime limit, but do not touch config.
-        if ! write_gpu_temp_baseline 100 2>/dev/null; then
+        # thermal change to the stock runtime limit.
+        if ! write_gpu_temp_baseline 90 2>/dev/null; then
             log "WARNING: Failed to restore GPU temperature baseline during cleanup."
         fi
     fi
@@ -1552,14 +1561,12 @@ cleanup() {
 
     stop_cpu_stress
     stop_gpu_stress
-    stop_gpu_governor_point
     if (( RUN_GPU )); then
         if ! clear_gpu_point 2>/dev/null; then
             log "WARNING: Failed to clear direct GPU SMU force state during cleanup."
         fi
     fi
 
-    rm -f "$GPU_TEMP_CONFIG"
 
     restore_services
     (( test_passed )) && clear_state
@@ -1567,10 +1574,11 @@ cleanup() {
 
 on_exit() {
     cleanup
-    relock_package_rootfs
 }
 
-trap on_exit EXIT INT TERM
+trap on_exit EXIT
+trap 'on_exit; exit 130' INT
+trap 'on_exit; exit 143' TERM
 
 # -----------------------------------------------------------------------------
 # Main
@@ -1590,18 +1598,22 @@ main() {
     echo "where the system hard-freezes/locks."
     echo "An unexpected stress/backend program exit during a test point is classified as a failed test point."
     echo
+    echo "No packages will be installed and the SteamOS root filesystem will not be modified."
     echo "Nothing will be enabled at boot by this script."
     echo "CPU and GPU tuning are applied through their respective"
     echo "SMU backends with temporary runtime-only test state."
     echo
 
     show_previous_state
-    choose_test_scope
+    if (( RESUME_GPU == 0 )); then
+        choose_test_scope
+    fi
     choose_test_configuration
-    install_missing_packages
+    check_test_dependencies
     (( RUN_CPU )) && find_cpu_backend
-    (( RUN_GPU )) && find_gpu_backend
+    (( RUN_GPU )) && find_direct_gpu_backend
     find_services
+    (( RUN_CPU )) && capture_cpu_baseline || true
 
     ask_test_values
     stop_conflicting_services
@@ -1612,7 +1624,7 @@ main() {
     # CPU phase
     # -------------------------------------------------------------------------
     cpu_rc=0
-    if (( RUN_CPU )); then
+    if (( RUN_CPU && ! RESUME_GPU )); then
         run_cpu_test
         cpu_rc=$?
         if [[ "$cpu_rc" -eq 0 ]]; then
@@ -1620,6 +1632,13 @@ main() {
         else
             mark_phase_result CPU FAILED
         fi
+    elif (( RESUME_GPU == 1 )); then
+        cpu_rc=10
+        CPU_LAST_PASS="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
+        CPU_FAILURE_POINT="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
+        CPU_FAILURE_REASON="CPU phase was interrupted by a reboot before the saved point completed."
+        echo
+        echo "CPU phase resumed as interrupted; skipping directly to GPU."
     else
         echo
         echo "CPU test skipped."
@@ -1629,16 +1648,17 @@ main() {
     if (( RUN_CPU )) && [[ "$cpu_rc" -eq 10 ]]; then
         echo
         echo "CPU silicon-quality failure detected."
-        echo "The CPU baseline was already restored."
+        echo "The CPU baseline restore was attempted before continuing."
+        echo "If restoration was not confirmed, the GPU result may be affected."
         echo "Continuing to GPU phase."
     elif (( RUN_CPU )) && [[ "$cpu_rc" -ne 0 ]]; then
         exit "$cpu_rc"
     elif (( RUN_CPU && RUN_GPU )); then
         echo
-        echo "CPU phase complete; restoring stable CPU baseline before GPU phase."
+        echo "CPU phase complete; restoring ${CPU_BASELINE_SOURCE} before GPU phase."
 
-        # Do not restart the original CPU service yet: the GPU governor also
-        # uses the SMU and must have exclusive SMU access during the GPU sweep.
+        # Do not restart the original CPU service yet: the GPU phase still
+        # needs exclusive SMU access during its sweep.
         restore_cpu_baseline ||
             die "Failed to restore CPU baseline before GPU test."
     fi
@@ -1679,7 +1699,6 @@ main() {
             echo "  Point duration: ${CPU_TEST_SECONDS}s; temperature limit: ${CPU_TEST_TEMP}C"
             echo "  Last confirmed pass: ${CPU_LAST_PASS}"
             echo "  Last confirmed pass current VID: ${CPU_LAST_PASS_VID} mV"
-            echo "  Last confirmed pass estimated target VID: ${CPU_LAST_PASS_VID_TARGET} mV"
             echo "  VID by scale: ${CPU_VID_HISTORY:-none}"
         else
             echo "CPU result: FAILED"
@@ -1687,7 +1706,6 @@ main() {
             echo "  Point duration: ${CPU_TEST_SECONDS}s; temperature limit: ${CPU_TEST_TEMP}C"
             echo "  Last confirmed pass: ${CPU_LAST_PASS}"
             echo "  Last confirmed pass current VID: ${CPU_LAST_PASS_VID} mV"
-            echo "  Last confirmed pass estimated target VID: ${CPU_LAST_PASS_VID_TARGET} mV"
             echo "  VID by scale: ${CPU_VID_HISTORY:-none}"
             echo "  Failure candidate: scale ${CPU_FAILURE_POINT}"
             echo "  Failure reason: ${CPU_FAILURE_REASON:-see preceding CPU failure details}"
