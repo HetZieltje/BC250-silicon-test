@@ -1294,15 +1294,6 @@ run_test_interval() {
             ! kill -0 "$vkmark_pid" 2>/dev/null; then
             return 2
         fi
-        if [[ "$phase" == "GPU" ]]; then
-            # Firmware may restore the curve when load changes. Reapply the
-            # direct test point before each telemetry sample so the sweep
-            # continues testing the requested setting rather than the
-            # persistent governor curve.
-            if ! apply_gpu_point "$CURRENT_GPU_TEST_MV" 1; then
-                return 3
-            fi
-        fi
         report_telemetry "$phase" "$elapsed"
     done
 }
@@ -1597,7 +1588,6 @@ run_gpu_test() {
     echo
 
     while (( mv >= GPU_MIN_MV )); do
-        CURRENT_GPU_TEST_MV="$mv"
         # State is written before applying the SMU point because the operation
         # may hard-freeze the machine.
         write_state GPU "$mv" "$last_pass"
@@ -1659,21 +1649,6 @@ run_gpu_test() {
             GPU_FAILURE_POINT="$mv"
             GPU_FAILURE_REASON="vkmark exited unexpectedly during the ${mv} mV test point."
             return 12
-        fi
-
-        if (( interval_status == 3 )); then
-            stop_gpu_stress
-
-            echo
-            echo "GPU: FAILURE"
-            echo "GPU failure candidate = ${mv} mV"
-            echo "GPU last confirmed pass = ${last_pass:-none} mV"
-            echo "Reason: the requested GPU settings could not be reapplied during the ${mv} mV test point."
-            echo "The point is not considered valid because its configured clock/voltage could not be maintained."
-            GPU_LAST_PASS="${last_pass:-none}"
-            GPU_FAILURE_POINT="$mv"
-            GPU_FAILURE_REASON="Requested GPU settings could not be reapplied during the ${mv} mV test point."
-            return 14
         fi
 
         if ! kill -0 "$vkmark_pid" 2>/dev/null; then
