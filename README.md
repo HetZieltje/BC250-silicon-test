@@ -53,7 +53,7 @@ The script:
 ### CPU
 
 - Clock: `3500 MHz`
-- Starting scale: `-30`
+- Starting scale: `-20`
 - Step: `-1`
 - Floor: `-50`
 - Duration: `30 seconds` per point
@@ -70,7 +70,7 @@ the loaded telemetry interval.
 ### GPU
 
 - Clock: `1500 MHz`
-- Starting voltage: `850 mV`
+- Starting voltage: `900 mV`
 - Step: `-10 mV`
 - Floor: `600 mV`
 - Duration: `30 seconds` per point
@@ -110,7 +110,7 @@ CPU `stress-ng` exiting unexpectedly is treated as the CPU silicon cutoff and
 allows a combined run to continue to the GPU phase. A GPU `vkmark` exit is
 treated as a failed GPU point.
 
-## Interrupted runs and reboot recovery
+## Interrupted runs and recovery
 
 The script saves checkpoint state in:
 
@@ -124,8 +124,9 @@ It also appends operational logs to:
 ~/.bc250-silicon-test.log
 ```
 
-State is written before risky SMU operations. If the machine hard-locks and
-you reboot and rerun the script:
+State is written before risky SMU operations. If a test crashes, stops
+unexpectedly, or the machine hard-locks and you reboot before rerunning the
+script:
 
 - An interrupted CPU phase can be marked interrupted and continued directly
   with the GPU phase.
@@ -136,6 +137,10 @@ you reboot and rerun the script:
 
 Use the saved state display to confirm the phase, point, and last confirmed pass
 before choosing a recovery action.
+
+The script waits for the user to press a key before exiting, including after a
+successful test, a failed test, cancellation, or an error. This keeps the
+terminal open long enough to review the result.
 
 ## Runtime safety and cleanup
 
