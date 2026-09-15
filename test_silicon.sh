@@ -3,7 +3,7 @@
 # BC-250 Silicon Quality Test
 #
 # Runtime-only silicon screening for an AMD BC-250.
-# Instability is defined as a system hard-freeze/lock.
+# Instability is defined as a system hard-freeze/lock or program crash.
 # This script does not install packages, change the SteamOS root filesystem,
 # enable boot services, or modify persistent CPU/GPU tuning configuration.
 #
@@ -50,6 +50,7 @@ ORIG_CPU_SERVICE_ACTIVE=0
 ORIG_GPU_SERVICE_ACTIVE=0
 
 cleanup_done=0
+pause_done=0
 test_initialized=0
 test_passed=0
 CPU_LAST_PASS="none"
@@ -585,9 +586,25 @@ show_previous_state() {
 
     if [[ "$saved_phase" == "CPU" &&
         ( "$saved_cpu_status" == "IN_PROGRESS" || "$saved_cpu_status" == "FAILED_INTERRUPTED" ) ]]; then
+        local saved_cpu_last_pass
+        local saved_cpu_last_pass_vid
+        local saved_cpu_vid_history
+        local saved_cpu_point
+
+        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
+        saved_cpu_last_pass_vid="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
+        saved_cpu_vid_history="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
+        saved_cpu_point="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
+
         echo
         echo "The previous CPU phase was interrupted before it completed."
-        echo "The CPU cutoff is already recorded; the GPU phase can continue."
+        echo "CPU result: FAILED (test stopped before completion)"
+        echo "  Last confirmed pass: ${saved_cpu_last_pass:-none}"
+        echo "  Last confirmed pass current VID: ${saved_cpu_last_pass_vid:-none} mV"
+        echo "  VID by scale: ${saved_cpu_vid_history:-none}"
+        echo "  Failure candidate: scale ${saved_cpu_point:-unknown}"
+        echo "  Failure reason: the CPU phase stopped before the current point completed."
+        echo "  Result meaning: no conclusion below the last confirmed passing scale."
         echo
         read -rp "Continue the previous run with the GPU test? [Y/n] " ans
         if [[ ! "$ans" =~ ^[Nn]$ ]]; then
@@ -655,7 +672,7 @@ show_previous_state() {
             cpu_rc=0
         else
             cpu_rc=10
-            CPU_FAILURE_REASON="CPU phase was interrupted by a reboot before the saved point completed."
+            CPU_FAILURE_REASON="CPU phase stopped before the saved point completed."
         fi
         gpu_rc=12
         GPU_LAST_PASS="${saved_gpu_last_pass:-none}"
@@ -689,7 +706,7 @@ show_previous_state() {
         CPU_LAST_PASS_VID="${saved_cpu_last_pass_vid:-none}"
         CPU_VID_HISTORY="${saved_cpu_vid_history:-}"
         CPU_FAILURE_POINT="${saved_cpu_failure_point:-$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")}"
-        CPU_FAILURE_REASON="${saved_cpu_failure_reason:-CPU phase was interrupted by a reboot before the saved point completed.}"
+        CPU_FAILURE_REASON="${saved_cpu_failure_reason:-CPU phase stopped before the saved point completed.}"
         if [[ "$CPU_LAST_PASS_VID" == "none" && -n "$CPU_VID_HISTORY" ]]; then
             CPU_LAST_PASS_VID="$(printf '%s\n' "$CPU_VID_HISTORY" |
                 awk -v target="scale=${CPU_LAST_PASS}:" 'BEGIN {RS=", "}
@@ -714,7 +731,7 @@ show_previous_state() {
         saved_gpu_failure_reason="$(awk -F= '$1 == "gpu_failure_reason" {print $2}' "$STATE_FILE")"
         GPU_LAST_PASS="${saved_gpu_last_pass:-none}"
         GPU_FAILURE_POINT="${saved_gpu_failure_point:-$(awk -F= '$1 == "gpu_point" {print $2}' "$STATE_FILE")}"
-        GPU_FAILURE_REASON="${saved_gpu_failure_reason:-GPU phase was interrupted by a reboot before the saved point completed.}"
+        GPU_FAILURE_REASON="${saved_gpu_failure_reason:-GPU phase stopped before the saved point completed.}"
         if [[ "$saved_gpu_status" == "PASS" ]]; then
             gpu_rc=0
         else
@@ -1731,8 +1748,17 @@ cleanup() {
     (( test_passed )) && clear_state
 }
 
+pause_before_exit() {
+    [[ "$pause_done" -eq 1 ]] && return
+    pause_done=1
+    echo
+    read -r -n 1 -s -p "Press any key to close this terminal..."
+    echo
+}
+
 on_exit() {
     cleanup
+    pause_before_exit
 }
 
 trap on_exit EXIT
@@ -1796,7 +1822,7 @@ main() {
         cpu_rc=10
         CPU_LAST_PASS="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
         CPU_FAILURE_POINT="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
-        CPU_FAILURE_REASON="CPU phase was interrupted by a reboot before the saved point completed."
+        CPU_FAILURE_REASON="CPU phase stopped before the saved point completed."
         echo
         echo "CPU phase resumed as interrupted; skipping directly to GPU."
     else
