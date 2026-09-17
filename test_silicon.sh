@@ -30,7 +30,7 @@ CPU_TEST_TEMP=95
 GPU_FREQ=1500
 GPU_START_MV=900
 GPU_STEP_MV=-10
-GPU_MIN_MV=600
+GPU_MIN_MV=650
 GPU_TEST_SECONDS=30
 GPU_TEST_TEMP=90
 
@@ -42,9 +42,6 @@ CPU_BASELINE_SOURCE="stable fallback"
 
 BC250_CONTROL_DIR="${BC250_CONTROL_DIR:-/var/lib/bc250-control}"
 BC250_OC_DIR="${BC250_OC_DIR:-$BC250_CONTROL_DIR/smu-oc}"
-
-GPU_GOVERNOR_UNIT=""
-CPU_SERVICE_UNIT=""
 
 ORIG_CPU_SERVICE_ACTIVE=0
 ORIG_GPU_SERVICE_ACTIVE=0
@@ -67,7 +64,35 @@ stress_pid=""
 vkmark_pid=""
 
 SMU_RETRIES=3
-GPU_CLOCK_RESTARTS=2
+
+# GPU SMU points must be verifiable, not just "applied". A point only counts as
+# observed when the live SMU readback (frequency and voltage) matches what was
+# requested, both right after applying it and again while the stressor runs.
+GPU_MV_TOLERANCE=5
+GPU_POINT_TRIES=2
+
+# bc250_smu polls its mailbox a fixed number of times per command. The library
+# default (100) is a few milliseconds, which is short enough that a busy SMU
+# answers "no response" (status 0x00) and an otherwise fine point is retried or
+# failed for no reason. Poll an order of magnitude longer instead.
+SMU_MAILBOX_POLLS=4000
+
+# Services that drive the same SMU mailbox as this test. While any of them is
+# running it can (and does) re-apply its own GPU frequency/voltage on top of the
+# test point, so every one has to be stopped and verified stopped.
+GPU_CONFLICT_UNITS=()
+CPU_CONFLICT_UNITS=()
+STOPPED_GPU_UNITS=()
+STOPPED_CPU_UNITS=()
+
+# Live voltage the SMU reported for the currently applied point, and whether the
+# GPU result must be reported as an invalid measurement rather than a failure.
+GPU_POINT_REQ_MV="none"
+GPU_POINT_LIVE_MV="none"
+GPU_POINT_GOOD_SAMPLES=0
+GPU_POINT_BAD_SAMPLES=0
+GPU_INVALID=0
+GPU_INVALID_REASON=""
 RUN_CPU=1
 RUN_GPU=1
 USE_DEFAULT_VALUES=0
@@ -327,12 +352,12 @@ ask_gpu_values() {
         read -rp "GPU start mV [${GPU_START_MV}]: " v
         [[ -z "$v" ]] && v="$GPU_START_MV"
 
-        if validate_positive_int "$v" && (( v >= 600 && v <= 1100 )); then
+        if validate_positive_int "$v" && (( v >= 700 && v <= 1100 )); then
             GPU_START_MV="$v"
             break
         fi
 
-        echo "Invalid GPU start voltage. Enter a value from 600 to 1100 mV."
+        echo "Invalid GPU start voltage. Enter a value from 700 to 1100 mV."
     done
 
     while true; do
@@ -351,7 +376,7 @@ ask_gpu_values() {
         read -rp "GPU floor mV [${GPU_MIN_MV}]: " v
         [[ -z "$v" ]] && v="$GPU_MIN_MV"
 
-        if validate_positive_int "$v" && (( v >= 600 && v <= 1100 && GPU_START_MV >= v )); then
+        if validate_positive_int "$v" && (( v >= 600 && v <= 1129 && GPU_START_MV >= v )); then
             delta=$((GPU_START_MV - v))
             step_abs=$((-GPU_STEP_MV))
 
@@ -364,7 +389,7 @@ ask_gpu_values() {
             continue
         fi
 
-        echo "Invalid GPU floor. It must be between 600 and 1100 mV and no higher than the start voltage."
+        echo "Invalid GPU floor. It must be between 600 and 1129 mV and no higher than the start voltage."
     done
 
     while true; do
@@ -451,11 +476,22 @@ show_test_report() {
         if (( GPU_NOT_RUN )); then
             echo "GPU result: SKIPPED"
             echo "  Reason: GPU phase was not started after the CPU phase failed."
+        elif (( GPU_INVALID )); then
+            echo "GPU result: INVALID MEASUREMENT"
+            echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} toward ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
+            echo "  Point duration: ${GPU_TEST_SECONDS}s; temperature limit: ${GPU_TEST_TEMP}C"
+            echo "  Last confirmed pass: ${GPU_LAST_PASS} mV"
+            echo "  Unconfirmed point: ${GPU_FAILURE_POINT} mV"
+            echo "  Reason: ${GPU_INVALID_REASON:-see preceding GPU failure details}"
+            echo "  Result meaning: the sweep could not keep the requested voltage applied, so"
+            echo "  this run does not support any silicon-quality conclusion."
         elif [[ "$gpu_rc" -eq 0 ]]; then
             echo "GPU result: PASS"
             echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} to ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
             echo "  Point duration: ${GPU_TEST_SECONDS}s; temperature limit: ${GPU_TEST_TEMP}C"
             echo "  Last confirmed pass: ${GPU_LAST_PASS} mV"
+            echo "  Last verified live voltage: ${GPU_POINT_LIVE_MV} mV at ${GPU_FREQ} MHz"
+            echo "  Every point was verified against the live SMU readback for the whole interval."
         else
             echo "GPU result: FAILED"
             echo "  Tested: ${GPU_FREQ} MHz, ${GPU_START_MV} toward ${GPU_MIN_MV} mV by ${GPU_STEP_MV}"
@@ -544,18 +580,6 @@ state_set_field() {
     mv -f "$tmp" "$STATE_FILE"
 }
 
-state_get_field() {
-    local field="$1"
-
-    [[ -f "$STATE_FILE" ]] || return 0
-    awk -v field="$field" '
-        index($0, field "=") == 1 {
-            print substr($0, length(field) + 2)
-            exit
-        }
-    ' "$STATE_FILE"
-}
-
 state_remove_field() {
     local field="$1"
     local tmp="${STATE_FILE}.tmp"
@@ -592,10 +616,10 @@ show_previous_state() {
     local saved_cpu_status
     local saved_gpu_status
     local saved_gpu_point
-    saved_phase="$(state_get_field phase)"
-    saved_cpu_status="$(state_get_field cpu_status)"
-    saved_gpu_status="$(state_get_field gpu_status)"
-    saved_gpu_point="$(state_get_field gpu_point)"
+    saved_phase="$(awk -F= '$1 == "phase" {print $2}' "$STATE_FILE")"
+    saved_cpu_status="$(awk -F= '$1 == "cpu_status" {print $2}' "$STATE_FILE")"
+    saved_gpu_status="$(awk -F= '$1 == "gpu_status" {print $2}' "$STATE_FILE")"
+    saved_gpu_point="$(awk -F= '$1 == "gpu_point" {print $2}' "$STATE_FILE")"
 
     if [[ "$saved_phase" == "CPU" &&
         ( "$saved_cpu_status" == "IN_PROGRESS" || "$saved_cpu_status" == "FAILED_INTERRUPTED" ) ]]; then
@@ -604,10 +628,10 @@ show_previous_state() {
         local saved_cpu_vid_history
         local saved_cpu_point
 
-        saved_cpu_last_pass="$(state_get_field cpu_last_pass)"
-        saved_cpu_last_pass_vid="$(state_get_field cpu_last_pass_vid)"
-        saved_cpu_vid_history="$(state_get_field cpu_vid_history)"
-        saved_cpu_point="$(state_get_field cpu_point)"
+        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
+        saved_cpu_last_pass_vid="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
+        saved_cpu_vid_history="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
+        saved_cpu_point="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
 
         echo
         echo "The previous CPU phase was interrupted before it completed."
@@ -650,9 +674,9 @@ show_previous_state() {
             return 0
         fi
 
-        saved_gpu_last_pass="$(state_get_field gpu_last_pass)"
-        saved_cpu_status="$(state_get_field cpu_status)"
-        saved_cpu_last_pass="$(state_get_field cpu_last_pass)"
+        saved_gpu_last_pass="$(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE")"
+        saved_cpu_status="$(awk -F= '$1 == "cpu_status" {print $2}' "$STATE_FILE")"
+        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
         state_set_field gpu_status "FAILED"
         state_set_field gpu_failure_point "$saved_gpu_point"
         state_set_field gpu_failure_reason "System hard-locked during the GPU point; ${saved_gpu_point} mV is the cutoff."
@@ -667,9 +691,9 @@ show_previous_state() {
         RUN_CPU=1
         RUN_GPU=1
         CPU_LAST_PASS="${saved_cpu_last_pass:-none}"
-        CPU_LAST_PASS_VID="$(state_get_field cpu_last_pass_vid)"
-        CPU_VID_HISTORY="$(state_get_field cpu_vid_history)"
-        CPU_FAILURE_POINT="$(state_get_field cpu_point)"
+        CPU_LAST_PASS_VID="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
+        CPU_VID_HISTORY="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
+        CPU_FAILURE_POINT="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
         if [[ ( -z "$CPU_LAST_PASS_VID" || "$CPU_LAST_PASS_VID" == "none" ) &&
             -n "$CPU_VID_HISTORY" ]]; then
             CPU_LAST_PASS_VID="$(printf '%s\n' "$CPU_VID_HISTORY" |
@@ -710,15 +734,15 @@ show_previous_state() {
 
     if [[ -n "$saved_cpu_status" ]]; then
         RUN_CPU=1
-        saved_cpu_last_pass="$(state_get_field cpu_last_pass)"
-        saved_cpu_last_pass_vid="$(state_get_field cpu_last_pass_vid)"
-        saved_cpu_vid_history="$(state_get_field cpu_vid_history)"
-        saved_cpu_failure_point="$(state_get_field cpu_failure_point)"
-        saved_cpu_failure_reason="$(state_get_field cpu_failure_reason)"
+        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
+        saved_cpu_last_pass_vid="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
+        saved_cpu_vid_history="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
+        saved_cpu_failure_point="$(awk -F= '$1 == "cpu_failure_point" {print $2}' "$STATE_FILE")"
+        saved_cpu_failure_reason="$(awk -F= '$1 == "cpu_failure_reason" {print $2}' "$STATE_FILE")"
         CPU_LAST_PASS="${saved_cpu_last_pass:-none}"
         CPU_LAST_PASS_VID="${saved_cpu_last_pass_vid:-none}"
         CPU_VID_HISTORY="${saved_cpu_vid_history:-}"
-        CPU_FAILURE_POINT="${saved_cpu_failure_point:-$(state_get_field cpu_point)}"
+        CPU_FAILURE_POINT="${saved_cpu_failure_point:-$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")}"
         CPU_FAILURE_REASON="${saved_cpu_failure_reason:-CPU phase stopped before the saved point completed.}"
         if [[ "$CPU_LAST_PASS_VID" == "none" && -n "$CPU_VID_HISTORY" ]]; then
             CPU_LAST_PASS_VID="$(printf '%s\n' "$CPU_VID_HISTORY" |
@@ -739,11 +763,11 @@ show_previous_state() {
 
     if [[ -n "$saved_gpu_status" ]]; then
         RUN_GPU=1
-        saved_gpu_last_pass="$(state_get_field gpu_last_pass)"
-        saved_gpu_failure_point="$(state_get_field gpu_failure_point)"
-        saved_gpu_failure_reason="$(state_get_field gpu_failure_reason)"
+        saved_gpu_last_pass="$(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE")"
+        saved_gpu_failure_point="$(awk -F= '$1 == "gpu_failure_point" {print $2}' "$STATE_FILE")"
+        saved_gpu_failure_reason="$(awk -F= '$1 == "gpu_failure_reason" {print $2}' "$STATE_FILE")"
         GPU_LAST_PASS="${saved_gpu_last_pass:-none}"
-        GPU_FAILURE_POINT="${saved_gpu_failure_point:-$(state_get_field gpu_point)}"
+        GPU_FAILURE_POINT="${saved_gpu_failure_point:-$(awk -F= '$1 == "gpu_point" {print $2}' "$STATE_FILE")}"
         GPU_FAILURE_REASON="${saved_gpu_failure_reason:-GPU phase stopped before the saved point completed.}"
         if [[ "$saved_gpu_status" == "PASS" ]]; then
             gpu_rc=0
@@ -890,42 +914,149 @@ find_direct_gpu_backend() {
     log "Using direct bc250_smu queue-0 GPU backend: $BC250_OC_DIR"
 }
 
-find_services() {
-    if systemctl list-unit-files --type=service --no-legend 2>/dev/null |
-        awk '{print $1}' |
-        grep -qx 'cyan-skillfish-governor-smu.service'; then
+unit_exists() {
+    local wanted="$1"
 
-        GPU_GOVERNOR_UNIT="cyan-skillfish-governor-smu.service"
+    [[ -n "$wanted" ]] || return 1
+
+    # awk has to consume the whole stream. `systemctl ... | awk | grep -qx`
+    # fails under `set -o pipefail`: as soon as grep -q matches it closes the
+    # pipe, awk dies of SIGPIPE (141) and the pipeline reports failure even
+    # though the unit was found. That silently disabled every service stop, so
+    # the GPU governor kept running through the whole sweep.
+    systemctl list-unit-files --type=service --no-legend 2>/dev/null |
+        awk -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit !found }'
+}
+
+smu_config_path() {
+    printf '/sys/bus/pci/devices/0000:00:00.0/config'
+}
+
+smu_client_pids() {
+    # PIDs that currently hold the SMU PCI config file open. bc250_smu and the
+    # cyan-skillfish governor both drive the same mailbox through this file, so
+    # any process listed here can overwrite a test point mid-interval.
+    local config
+
+    config="$(smu_config_path)"
+
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -t "$config" 2>/dev/null | sort -u
+        return 0
     fi
 
-    if systemctl list-unit-files --type=service --no-legend 2>/dev/null |
-        awk '{print $1}' |
-        grep -qx 'bc250-smu-oc.service'; then
+    pgrep -f 'cyan-skillfish-governor' 2>/dev/null | sort -u
+}
 
-        CPU_SERVICE_UNIT="bc250-smu-oc.service"
+find_services() {
+    local unit
+
+    for unit in cyan-skillfish-governor-smu.service \
+        cyan-skillfish-governor.service \
+        cyan-skillfish-governor-tt.service \
+        oberon-governor.service; do
+
+        if unit_exists "$unit"; then
+            GPU_CONFLICT_UNITS+=("$unit")
+        fi
+    done
+
+    for unit in bc250-smu-oc.service; do
+        if unit_exists "$unit"; then
+            CPU_CONFLICT_UNITS+=("$unit")
+        fi
+    done
+
+    if (( ${#GPU_CONFLICT_UNITS[@]} == 0 )); then
+        log "WARNING: no known GPU SMU governor unit found; a competing SMU client would invalidate the sweep."
     fi
 }
 
+stop_unit_and_verify() {
+    local unit="$1"
+    local attempt
+
+    log "Stopping conflicting SMU service: $unit"
+
+    systemctl stop "$unit" || return 1
+
+    for ((attempt = 1; attempt <= 20; attempt++)); do
+        if ! systemctl is-active --quiet "$unit"; then
+            log "Confirmed stopped: $unit"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    log "ERROR: $unit is still active after systemctl stop."
+    return 1
+}
+
 stop_conflicting_services() {
-    if [[ -n "$GPU_GOVERNOR_UNIT" ]] &&
-        systemctl is-active --quiet "$GPU_GOVERNOR_UNIT"; then
+    local unit
 
-        ORIG_GPU_SERVICE_ACTIVE=1
+    for unit in "${GPU_CONFLICT_UNITS[@]}"; do
+        if systemctl is-active --quiet "$unit"; then
+            ORIG_GPU_SERVICE_ACTIVE=1
 
-        log "Stopping active GPU governor temporarily: $GPU_GOVERNOR_UNIT"
-        systemctl stop "$GPU_GOVERNOR_UNIT" ||
-            die "Could not stop GPU governor."
-    fi
+            stop_unit_and_verify "$unit" ||
+                die "Could not stop GPU SMU client $unit. The sweep would measure that client's voltage instead of the test point."
 
-    if [[ -n "$CPU_SERVICE_UNIT" ]] &&
-        systemctl is-active --quiet "$CPU_SERVICE_UNIT"; then
+            STOPPED_GPU_UNITS+=("$unit")
+        fi
+    done
 
-        ORIG_CPU_SERVICE_ACTIVE=1
+    for unit in "${CPU_CONFLICT_UNITS[@]}"; do
+        if systemctl is-active --quiet "$unit"; then
+            ORIG_CPU_SERVICE_ACTIVE=1
 
-        log "Stopping active CPU OC service temporarily: $CPU_SERVICE_UNIT"
-        systemctl stop "$CPU_SERVICE_UNIT" ||
-            die "Could not stop CPU OC service."
-    fi
+            stop_unit_and_verify "$unit" ||
+                die "Could not stop CPU OC service $unit."
+
+            STOPPED_CPU_UNITS+=("$unit")
+        fi
+    done
+}
+
+verify_smu_exclusive() {
+    # Confirm that nothing else still drives the SMU mailbox. Called before the
+    # GPU sweep starts; a false pass here is what made the old results look
+    # healthy while the governor was forcing its own point.
+    local attempt
+    local pids
+    local clean_samples=0
+
+    for ((attempt = 1; attempt <= 10; attempt++)); do
+        pids="$(smu_client_pids)"
+
+        if [[ -z "$pids" ]]; then
+            clean_samples=$((clean_samples + 1))
+            if (( clean_samples >= 2 )); then
+                return 0
+            fi
+        else
+            clean_samples=0
+        fi
+
+        sleep 0.5
+    done
+
+    for pids in $(smu_client_pids); do
+        log "ERROR: PID ${pids} ($(ps -o comm= -p "$pids" 2>/dev/null || printf 'unknown')) holds $(smu_config_path)."
+    done
+
+    return 1
+}
+
+assert_smu_exclusive() {
+    # Cheap single-shot version used before each GPU point.
+    local pids
+
+    pids="$(smu_client_pids)"
+    [[ -z "$pids" ]] && return 0
+
+    log "ERROR: another SMU client is active again: $(ps -o pid=,comm= -p $pids 2>/dev/null | awk '{printf "%s(%s) ", $1, $2}')"
+    return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -1165,30 +1296,41 @@ read_gpu_temperature() {
     printf 'unavailable'
 }
 
-read_gpu_clock() {
-    local clock
-
-    # Queue-0 0x37 returns the live SMU-reported GFX clock, not GPU_FREQ.
-    clock="$(
-        PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-            python3 - <<'PY' 2>/dev/null
+read_gpu_point_state() {
+    # One SMU session per sample (the governor and other clients own the
+    # transport at other times), returning "<clock_mhz> <voltage_mv>".
+    PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 - "$SMU_MAILBOX_POLLS" <<'PY' 2>/dev/null
+import sys
 from bc250_smu import Bc250Smu
 
-smu = Bc250Smu(allow_queue0=True, use_flock=True)
+polls = int(sys.argv[1])
+smu = Bc250Smu(allow_queue0=True, use_flock=True, timeout=polls)
 try:
-    print(smu.get_gfx_frequency())
+    print(int(smu.get_gfx_frequency()), int(smu.q3_0x37_get_current_gpu_voltage()))
 finally:
     smu.close()
 PY
-    )"
+}
+
+read_gpu_clock() {
+    local state clock
+
+    state="$(read_gpu_point_state)"
+
+    # Queue-0 0x37 returns the live SMU-reported GFX clock, not GPU_FREQ.
+    read -r clock _ <<< "$state"
 
     [[ "$clock" =~ ^[0-9]+$ ]] && printf '%sMHz' "$clock" || printf 'unavailable'
 }
 
 read_gpu_voltage() {
-    local voltage
+    local state voltage
 
-    voltage="$(read_gpu_voltage_mv)"
+    state="$(read_gpu_point_state)"
+
+    read -r _ voltage <<< "$state"
+
     if [[ "$voltage" =~ ^[0-9]+$ ]]; then
         printf '%smV' "$voltage"
     else
@@ -1197,31 +1339,13 @@ read_gpu_voltage() {
 }
 
 read_gpu_voltage_mv() {
-    local voltage
-    local attempt
+    local state voltage
 
-    for ((attempt = 1; attempt <= SMU_RETRIES; attempt++)); do
-        voltage="$(
-            PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-                python3 - <<'PY' 2>/dev/null
-from bc250_smu import Bc250Smu
+    state="$(read_gpu_point_state)"
 
-smu = Bc250Smu(use_flock=True)
-try:
-    print(smu.q3_0x37_get_current_gpu_voltage())
-finally:
-    smu.close()
-PY
-        )"
+    read -r _ voltage <<< "$state"
 
-        if [[ "$voltage" =~ ^[0-9]+$ ]]; then
-            printf '%s' "$voltage"
-            return 0
-        fi
-        (( attempt < SMU_RETRIES )) && sleep 0.2
-    done
-
-    printf 'unavailable'
+    [[ "$voltage" =~ ^[0-9]+$ ]] && printf '%s' "$voltage" || printf 'unavailable'
 }
 
 throttle_warning() {
@@ -1245,37 +1369,62 @@ throttle_warning() {
     fi
 }
 
+gpu_sample_matches_target() {
+    # $1 live clock (MHz), $2 live voltage (mV), $3 requested clock, $4 requested mV
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    [[ "$2" =~ ^[0-9]+$ ]] || return 1
+    [[ "$3" =~ ^[0-9]+$ ]] || return 1
+    [[ "$4" =~ ^[0-9]+$ ]] || return 1
+
+    (( 10#$1 == 10#$3 )) || return 1
+    (( 10#$2 >= 10#$4 - GPU_MV_TOLERANCE )) || return 1
+    (( 10#$2 <= 10#$4 + GPU_MV_TOLERANCE )) || return 1
+}
+
 verify_gpu_point() {
     local requested_clock="$1"
+    local requested_mv="$2"
+    local state
+    local last_state=""
     local observed_clock
-    local observed_mhz
+    local observed_mv
     local attempt
-    local clock_verified=0
+    local verified=0
 
-    # The governor ramps from the previous point. Poll instead of treating the
-    # first instantaneous frequency sample as the final applied setting.
+    # The governor ramps from the previous point, so poll instead of treating
+    # the first instantaneous sample as the applied setting. Both the clock and
+    # the voltage must match: a point can sit at 1500 MHz while another SMU
+    # client (or the firmware) has pushed the voltage back to its own value -
+    # that is exactly the case that used to be logged as a PASS.
     for ((attempt = 1; attempt <= 10; attempt++)); do
-        observed_clock="$(read_gpu_clock)"
-        if [[ "$observed_clock" != "unavailable" ]]; then
-            observed_mhz="${observed_clock%MHz}"
-            if [[ "$observed_mhz" =~ ^[0-9]+$ ]]; then
-                if (( observed_mhz == requested_clock )); then
-                    log "GPU live SMU clock readback verified at ${observed_clock}."
-                    clock_verified=1
-                    break
-                fi
-                log "Waiting for GPU clock to settle: live read ${observed_clock}, requested ${requested_clock}MHz."
-            else
-                log "Waiting for valid GPU clock readback: ${observed_clock}."
+        state="$(read_gpu_point_state)"
+        read -r observed_clock observed_mv <<< "$state"
+
+        if gpu_sample_matches_target "$observed_clock" "$observed_mv" \
+            "$requested_clock" "$requested_mv"; then
+
+            log "GPU point verified under stress: ${observed_clock} MHz / ${observed_mv} mV (requested ${requested_clock} MHz / ${requested_mv} mV)."
+            GPU_POINT_LIVE_MV="$observed_mv"
+            verified=1
+            break
+        fi
+
+        if [[ "$observed_clock" =~ ^[0-9]+$ ]] && [[ "$observed_mv" =~ ^[0-9]+$ ]]; then
+            # Only report a change (or the last attempt): the SMU ramps in
+            # small steps and one line per poll is just noise.
+            if [[ "$state" != "$last_state" || "$attempt" -eq 10 ]]; then
+                log "Waiting for the GPU point to settle: live ${observed_clock} MHz / ${observed_mv} mV, requested ${requested_clock} MHz / ${requested_mv} mV."
+                last_state="$state"
             fi
         else
-            log "Waiting for GPU clock readback; current value is unavailable."
+            log "Waiting for a valid GPU readback: '${state:-empty}'."
         fi
+
         (( attempt < 10 )) && sleep 0.5
     done
 
-    if (( ! clock_verified )); then
-        log "ERROR: GPU live SMU clock did not reach ${requested_clock}MHz within the settling window."
+    if (( ! verified )); then
+        log "ERROR: the GPU point did not hold ${requested_clock} MHz / ${requested_mv} mV within the settling window."
         return 1
     fi
 }
@@ -1284,9 +1433,11 @@ report_telemetry() {
     local phase="$1"
     local elapsed="$2"
     local temperature
+    local state
     local clock
     local voltage
     local warning
+    local verdict
 
     if [[ "$phase" == "CPU" ]]; then
         temperature="$(read_cpu_temperature)"
@@ -1297,11 +1448,23 @@ report_telemetry() {
             "$elapsed" "$CPU_TEST_SECONDS" "$temperature" "$clock" "$voltage" "$warning"
     else
         temperature="$(read_gpu_temperature)"
-        clock="$(read_gpu_clock)"
-        voltage="$(read_gpu_voltage)"
-        warning="$(throttle_warning "$temperature" "$clock" "$GPU_TEST_TEMP" "$GPU_FREQ")"
-        printf '  [%s/%ss] GPU telemetry: temp %s, SMU clock %s, current voltage %s%s\n' \
-            "$elapsed" "$GPU_TEST_SECONDS" "$temperature" "$clock" "$voltage" "$warning"
+        state="$(read_gpu_point_state)"
+        read -r clock voltage <<< "$state"
+        warning="$(throttle_warning "$temperature" "${clock}MHz" "$GPU_TEST_TEMP" "$GPU_FREQ")"
+
+        if gpu_sample_matches_target "$clock" "$voltage" \
+            "$GPU_FREQ" "$GPU_POINT_REQ_MV"; then
+
+            verdict=""
+            GPU_POINT_GOOD_SAMPLES=$((GPU_POINT_GOOD_SAMPLES + 1))
+        else
+            verdict=" <-- MISMATCH, point was not held"
+            GPU_POINT_BAD_SAMPLES=$((GPU_POINT_BAD_SAMPLES + 1))
+        fi
+
+        printf '  [%s/%ss] GPU telemetry: temp %s, SMU clock %sMHz, live voltage %smV (requested %sMHz / %smV)%s%s\n' \
+            "$elapsed" "$GPU_TEST_SECONDS" "$temperature" "${clock:-unavailable}" \
+            "${voltage:-unavailable}" "$GPU_FREQ" "$GPU_POINT_REQ_MV" "$warning" "$verdict"
     fi
 }
 
@@ -1432,86 +1595,172 @@ run_cpu_test() {
 # -----------------------------------------------------------------------------
 write_gpu_temp_limit() {
     local temp="$1"
+    local error_file="/tmp/bc250-silicon-gpu-temp-$$.err"
 
     PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 - "$temp" 2>/dev/null <<'PY'
+        python3 - "$temp" "$SMU_MAILBOX_POLLS" 2>"$error_file" <<'__PY__'
 import sys
 import time
 from bc250_smu import Bc250Smu
 
-smu = Bc250Smu(use_flock=True)
-
+target = int(sys.argv[1])
+polls = int(sys.argv[2])
+smu = Bc250Smu(allow_queue0=True, use_flock=True, timeout=polls)
 try:
-    smu.q3_0x8c_set_gpu_max_temperature(int(sys.argv[1]))
-    time.sleep(1.0)
+    smu.q3_0x8c_set_gpu_max_temperature(target)
+    time.sleep(0.5)
 finally:
     smu.close()
-PY
+__PY__
+    local rc=$?
+    if (( rc != 0 )); then
+        [[ -s "$error_file" ]] && log "GPU temperature SMU error: $(<"$error_file")"
+        rm -f "$error_file"
+        return "$rc"
+    fi
+    rm -f "$error_file"
+
+    local hwmon_max
+    hwmon_max="$(read_gpu_hwmon_max_temperature 2>/dev/null || true)"
+    if [[ "$hwmon_max" =~ ^[0-9]+$ ]]; then
+        if (( hwmon_max != temp )); then
+            log "ERROR: GPU hwmon temperature limit reads ${hwmon_max}C, expected ${temp}C."
+            return 1
+        fi
+        log "GPU temperature limit independently verified at ${hwmon_max}C via hwmon."
+    else
+        log "GPU temperature limit command accepted, but the kernel exposes no temp*_max readback to confirm it; treat the ${temp}C limit as unverified and watch the telemetry temperature."
+    fi
 }
 
 write_gpu_temp_baseline() {
-    local temp="${1:-100}"
+    local temp="${1:-90}"
     write_gpu_temp_limit "$temp"
+}
+
+read_gpu_hwmon_max_temperature() {
+    local path hwmon_dir name value
+    for path in /sys/class/hwmon/hwmon*/temp*_max; do
+        [[ -r "$path" ]] || continue
+        hwmon_dir="${path%/*}"
+        name="$(cat "$hwmon_dir/name" 2>/dev/null || true)"
+        [[ "$name" == amdgpu* || "$name" == *gpu* ]] || continue
+        value="$(<"$path")"
+        [[ "$value" =~ ^[0-9]+$ ]] || continue
+        printf '%d\n' "$((value / 1000))"
+        return 0
+    done
+    return 1
 }
 
 apply_gpu_point() {
     local mv="$1"
     local quiet="${2:-0}"
     local attempt
+    local output_file="/tmp/bc250-silicon-gpu-apply-$$.out"
     local error_file="/tmp/bc250-silicon-gpu-apply-$$.err"
+    local live_mv
 
-    (( quiet )) || log "Applying direct GPU SMU point at ${GPU_FREQ} MHz / ${mv} mV"
+    (( quiet )) || log "Applying GPU SMU point at ${GPU_FREQ} MHz / ${mv} mV"
     for ((attempt = 1; attempt <= SMU_RETRIES; attempt++)); do
+        : > "$output_file"
         if PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-                python3 - "$GPU_FREQ" "$mv" 2>"$error_file" <<'PY'
+                python3 - "$GPU_FREQ" "$mv" "$SMU_MAILBOX_POLLS" "$GPU_MV_TOLERANCE" \
+                1>"$output_file" 2>"$error_file" <<'__PY__'
 import sys
 import time
 from bc250_smu import Bc250Smu
 
 frequency = int(sys.argv[1])
-voltage = int(sys.argv[2])
-smu = Bc250Smu(allow_queue0=True, use_flock=True)
+voltage_mv = int(sys.argv[2])
+polls = int(sys.argv[3])
+tolerance_mv = int(sys.argv[4])
+
+# IMPORTANT: bc250_smu's force_gfx_vid() already converts millivolts to
+# the SVI2 VID code internally. Passing a pre-converted VID here would
+# double-convert the voltage and can cause a severe undervoltage/crash.
+# A longer mailbox poll budget keeps a busy SMU from being reported as
+# "no response" (status 0x00) while a stressor hammers the GPU.
+smu = Bc250Smu(allow_queue0=True, use_flock=True, timeout=polls)
 try:
+    smu.check_test_message()
+
+    # Match cyan-skillfish-governor-smu's proven initialization/point order:
+    # clear previous forced state, then voltage, then frequency.
+    smu.unforce_gfx_freq()
+    smu.unforce_gfx_vid()
+    time.sleep(0.15)
+
+    smu.force_gfx_vid(voltage_mv)
+    time.sleep(0.10)
     smu.force_gfx_freq(frequency)
-    smu.force_gfx_vid(voltage)
-    # The queue-0 VID query is a live voltage reading, not a readback of the
-    # forced VID command. Validate the programmed point through the live clock
-    # and record live voltage later while the GPU is under stress.
-    time.sleep(1.0)
-    # The live clock is load-dependent. It is verified after vkmark starts,
-    # when the GPU is actually exercising the forced point.
+
+    # Poll instead of sampling once: the SMU ramps to the new point and a
+    # single immediate read is what made this fail intermittently.
+    deadline = time.time() + 5.0
+    live_freq = 0
+    live_mv = 0
+    while True:
+        live_freq = int(smu.get_gfx_frequency())
+        live_mv = int(smu.q3_0x37_get_current_gpu_voltage())
+
+        if live_freq == frequency and abs(live_mv - voltage_mv) <= tolerance_mv:
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(0.25)
+
+    if live_freq != frequency:
+        raise RuntimeError(
+            f"GPU frequency verification failed: requested {frequency}MHz, "
+            f"live {live_freq}MHz"
+        )
+
+    if abs(live_mv - voltage_mv) > tolerance_mv:
+        raise RuntimeError(
+            f"GPU voltage verification failed: requested {voltage_mv}mV, "
+            f"live {live_mv}mV (maximum allowed deviation is {tolerance_mv}mV)"
+        )
+
+    print(f"{live_freq} {live_mv}")
 except Exception as error:
-    print(f"GPU SMU apply failed: {error}", file=sys.stderr)
+    print(f"GPU SMU apply/verify failed: {error}", file=sys.stderr)
     raise SystemExit(1)
 finally:
     smu.close()
-PY
+__PY__
         then
+            live_mv="$(awk '{print $2}' "$output_file")"
             rm -f "$error_file"
+            GPU_POINT_LIVE_MV="${live_mv:-none}"
+
             if (( attempt > 1 )); then
-                log "GPU SMU apply succeeded on retry attempt ${attempt}."
+                log "GPU SMU apply/verification succeeded on retry attempt ${attempt}."
             fi
+
+            log "GPU point applied and verified: ${GPU_FREQ} MHz / ${mv} mV requested, live ${live_mv:-unknown} mV."
             return 0
         fi
         if [[ -s "$error_file" ]]; then
-            log "GPU SMU apply attempt ${attempt} failed: $(<"$error_file")"
+            log "GPU SMU apply/verification attempt ${attempt} failed: $(<"$error_file")"
         else
-            log "GPU SMU apply attempt ${attempt} failed without an error message."
+            log "GPU SMU apply/verification attempt ${attempt} failed without an error message."
         fi
-        (( attempt < SMU_RETRIES )) && sleep 0.5
+        (( attempt < SMU_RETRIES )) && sleep 0.75
     done
 
-    rm -f "$error_file"
-    log "Unable to apply GPU point after ${SMU_RETRIES} attempts."
+    rm -f "$output_file" "$error_file"
+    log "Unable to apply and independently verify GPU point after ${SMU_RETRIES} attempts."
     return 14
 }
+
 
 start_gpu_point() {
     local mv="$1"
 
     if ! retry_smu_operation "GPU temperature limit ${GPU_TEST_TEMP} C" \
         write_gpu_temp_limit "$GPU_TEST_TEMP"; then
-        log "ERROR: Could not set GPU temperature limit to ${GPU_TEST_TEMP} C after ${SMU_RETRIES} attempts."
+        log "ERROR: Could not apply/verify GPU temperature limit ${GPU_TEST_TEMP} C after ${SMU_RETRIES} attempts."
         return 13
     fi
 
@@ -1522,7 +1771,7 @@ start_gpu_point() {
 
 clear_gpu_point() {
     PYTHONPATH="$BC250_OC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 - 2>/dev/null <<'PY'
+        python3 - 2>/dev/null <<'__PY__'
 import time
 from bc250_smu import Bc250Smu
 
@@ -1530,10 +1779,10 @@ smu = Bc250Smu(allow_queue0=True, use_flock=True)
 try:
     smu.unforce_gfx_freq()
     smu.unforce_gfx_vid()
-    time.sleep(1.0)
+    time.sleep(0.5)
 finally:
     smu.close()
-PY
+__PY__
 }
 
 start_gpu_stress() {
@@ -1596,15 +1845,57 @@ stop_gpu_stress() {
     vkmark_pid=""
 }
 
+report_gpu_point_failure() {
+    local mv="$1"
+    local last_pass="$2"
+    local reason="$3"
+
+    echo
+    echo "GPU: FAILURE"
+    echo "GPU failure candidate = ${mv} mV"
+    echo "GPU last confirmed pass = ${last_pass:-none} mV"
+    echo "Reason: ${reason}"
+
+    if (( GPU_INVALID )); then
+        echo "This point is reported as an INVALID MEASUREMENT, not a silicon failure:"
+        echo "the GPU did not keep the forced test point, so this point says nothing"
+        echo "about silicon quality either way."
+    else
+        echo "The point is classified as a failed silicon-quality test point."
+    fi
+
+    GPU_LAST_PASS="${last_pass:-none}"
+    GPU_FAILURE_POINT="$mv"
+    GPU_FAILURE_REASON="$reason"
+}
+
 run_gpu_test() {
     local mv="$GPU_START_MV"
     local last_pass=""
     local interval_status=0
     local point_status=0
-    local clock_restart=0
+    local point_try
+    local point_ok
+    local samples_total
+
     GPU_LAST_PASS="none"
     GPU_FAILURE_POINT="none"
     GPU_FAILURE_REASON=""
+    GPU_INVALID=0
+    GPU_INVALID_REASON=""
+
+    # Hard gate: the sweep is only meaningful while this test is the only SMU
+    # client. Everything below assumes the forced point survives the interval.
+    if ! verify_smu_exclusive; then
+        GPU_INVALID=1
+        GPU_INVALID_REASON="another process was still driving the SMU mailbox when the sweep started"
+
+        report_gpu_point_failure "${mv}" "none" \
+            "the sweep was not started because another SMU client is active."
+        return 15
+    fi
+
+    log "SMU mailbox confirmed exclusive to this test."
 
     echo
     echo "=============================================="
@@ -1623,110 +1914,125 @@ run_gpu_test() {
         # may hard-freeze the machine.
         write_state GPU "$mv" "$last_pass"
 
-        point_status=0
-        start_gpu_point "$mv" || point_status=$?
-        if (( point_status != 0 )); then
+        # Any other SMU client would overwrite the point mid-interval, which is
+        # how the sweep used to report PASSes for a voltage it never applied.
+        if ! assert_smu_exclusive; then
+            GPU_INVALID=1
+            GPU_INVALID_REASON="another SMU client took the mailbox during the sweep"
 
-            echo
-            echo "GPU: FAILURE"
-            echo "GPU failure candidate = ${mv} mV"
-            echo "GPU last confirmed pass = ${last_pass:-none} mV"
-            GPU_LAST_PASS="${last_pass:-none}"
-            GPU_FAILURE_POINT="$mv"
-            if (( point_status == 13 )); then
-                echo "Reason: the GPU temperature limit could not be applied."
-                echo "The point is classified as a failed GPU temperature setup."
-                GPU_FAILURE_REASON="GPU temperature limit could not be applied before this test point."
-            else
-                echo "Reason: the GPU SMU clock could not be independently verified before this test point."
-                echo "The point is classified as a failed GPU setup verification."
-                GPU_FAILURE_REASON="GPU SMU clock could not be independently verified before this test point."
-            fi
-
-            return 13
+            report_gpu_point_failure "$mv" "$last_pass" \
+                "another SMU client is active again, so the ${mv} mV point cannot be measured."
+            return 15
         fi
 
-        clock_restart=0
-        while true; do
+        point_ok=0
+        for ((point_try = 1; point_try <= GPU_POINT_TRIES; point_try++)); do
+            GPU_POINT_REQ_MV="$mv"
+            GPU_POINT_LIVE_MV="none"
+            GPU_POINT_GOOD_SAMPLES=0
+            GPU_POINT_BAD_SAMPLES=0
+
+            point_status=0
+            start_gpu_point "$mv" || point_status=$?
+            if (( point_status != 0 )); then
+                if (( point_try < GPU_POINT_TRIES )); then
+                    log "Restarting the ${mv} mV point from the start (${point_try}/${GPU_POINT_TRIES})."
+                    stop_gpu_stress
+                    sleep 1
+                    continue
+                fi
+
+                if (( point_status == 13 )); then
+                    report_gpu_point_failure "$mv" "$last_pass" \
+                        "the GPU temperature limit could not be applied before this test point."
+                    return 13
+                fi
+
+                GPU_INVALID=1
+                GPU_INVALID_REASON="the GPU SMU point could not be applied and verified"
+
+                report_gpu_point_failure "$mv" "$last_pass" \
+                    "the GPU SMU point ${GPU_FREQ} MHz / ${mv} mV could not be applied and verified."
+                return 14
+            fi
+
             start_gpu_stress
 
             log "GPU point active: ${GPU_FREQ} MHz / ${mv} mV / GPU ${GPU_TEST_TEMP}C"
 
-            if verify_gpu_point "$GPU_FREQ"; then
-                break
-            fi
+            if ! verify_gpu_point "$GPU_FREQ" "$mv"; then
+                stop_gpu_stress
 
-            stop_gpu_stress
-            if (( clock_restart >= GPU_CLOCK_RESTARTS )); then
-                echo
-                echo "GPU: FAILURE"
-                echo "GPU failure candidate = ${mv} mV"
-                echo "GPU last confirmed pass = ${last_pass:-none} mV"
-                echo "Reason: the live GPU clock did not reach the requested frequency under stress after ${GPU_CLOCK_RESTARTS} pass restarts."
-                echo "The point is classified as a failed GPU clock verification."
-                GPU_LAST_PASS="${last_pass:-none}"
-                GPU_FAILURE_POINT="$mv"
-                GPU_FAILURE_REASON="Live GPU clock did not reach ${GPU_FREQ} MHz under stress after ${GPU_CLOCK_RESTARTS} pass restarts."
+                if (( point_try < GPU_POINT_TRIES )); then
+                    log "The ${mv} mV point did not hold; restarting it (${point_try}/${GPU_POINT_TRIES})."
+                    sleep 1
+                    continue
+                fi
+
+                GPU_INVALID=1
+                GPU_INVALID_REASON="live SMU readback never matched the requested point under stress"
+
+                report_gpu_point_failure "$mv" "$last_pass" \
+                    "the live SMU readback never matched the requested ${GPU_FREQ} MHz / ${mv} mV while the stressor was running."
                 return 14
             fi
 
-            clock_restart=$((clock_restart + 1))
-            log "GPU live clock did not hold ${GPU_FREQ} MHz; restarting pass ${clock_restart}/${GPU_CLOCK_RESTARTS}."
-            if ! clear_gpu_point || ! start_gpu_point "$mv"; then
-                echo
-                echo "GPU: FAILURE"
-                echo "GPU failure candidate = ${mv} mV"
-                echo "GPU last confirmed pass = ${last_pass:-none} mV"
-                echo "Reason: the GPU point could not be reapplied while restarting the pass."
-                echo "The point is classified as a failed GPU setup."
-                GPU_LAST_PASS="${last_pass:-none}"
-                GPU_FAILURE_POINT="$mv"
-                GPU_FAILURE_REASON="GPU point could not be reapplied while restarting the pass."
-                return 13
+            interval_status=0
+            run_test_interval GPU "$GPU_TEST_SECONDS" || interval_status=$?
+
+            if ! kill -0 "$vkmark_pid" 2>/dev/null; then
+                interval_status=2
             fi
+
+            stop_gpu_stress
+
+            if (( interval_status == 2 )); then
+                if (( point_try < GPU_POINT_TRIES )); then
+                    log "vkmark exited during the ${mv} mV point; restarting it (${point_try}/${GPU_POINT_TRIES})."
+                    sleep 1
+                    continue
+                fi
+
+                report_gpu_point_failure "$mv" "$last_pass" \
+                    "vkmark exited unexpectedly during the ${mv} mV test point."
+                return 12
+            fi
+
+            samples_total=$((GPU_POINT_GOOD_SAMPLES + GPU_POINT_BAD_SAMPLES))
+
+            if (( GPU_POINT_BAD_SAMPLES > 0 )); then
+                if (( point_try < GPU_POINT_TRIES )); then
+                    log "The ${mv} mV point was not held for ${GPU_POINT_BAD_SAMPLES} of ${samples_total} samples; restarting it (${point_try}/${GPU_POINT_TRIES})."
+                    sleep 1
+                    continue
+                fi
+
+                GPU_INVALID=1
+                GPU_INVALID_REASON="telemetry samples disagreed with the forced GPU point"
+
+                report_gpu_point_failure "$mv" "$last_pass" \
+                    "the forced point was not held: ${GPU_POINT_BAD_SAMPLES} of ${samples_total} samples disagreed with the requested ${GPU_FREQ} MHz / ${mv} mV."
+                return 15
+            fi
+
+            point_ok=1
+            break
         done
 
-        interval_status=0
-        run_test_interval GPU "$GPU_TEST_SECONDS" || interval_status=$?
+        if (( ! point_ok )); then
+            GPU_INVALID=1
+            GPU_INVALID_REASON="the ${mv} mV point could not be confirmed as applied"
 
-        if (( interval_status == 2 )); then
-            stop_gpu_stress
-
-            echo
-            echo "GPU: FAILURE"
-            echo "GPU failure candidate = ${mv} mV"
-            echo "GPU last confirmed pass = ${last_pass:-none} mV"
-            echo "Reason: vkmark exited unexpectedly during the ${mv} mV test point."
-            echo "The point is classified as a failed GPU silicon-quality test point."
-            GPU_LAST_PASS="${last_pass:-none}"
-            GPU_FAILURE_POINT="$mv"
-            GPU_FAILURE_REASON="vkmark exited unexpectedly during the ${mv} mV test point."
-            return 12
-        fi
-
-        if ! kill -0 "$vkmark_pid" 2>/dev/null; then
-            stop_gpu_stress
-
-            echo
-            echo "GPU: FAILURE"
-            echo "GPU failure candidate = ${mv} mV"
-            echo "GPU last confirmed pass = ${last_pass:-none} mV"
-            echo "Reason: vkmark exited unexpectedly during the ${mv} mV test point."
-            echo "The point is classified as a failed silicon-quality test point."
-            GPU_LAST_PASS="${last_pass:-none}"
-            GPU_FAILURE_POINT="$mv"
-            GPU_FAILURE_REASON="vkmark exited unexpectedly during the ${mv} mV test point."
-
-            return 12
+            report_gpu_point_failure "$mv" "$last_pass" \
+                "the ${mv} mV point could not be confirmed as applied and held."
+            return 15
         fi
 
         last_pass="$mv"
         GPU_LAST_PASS="$last_pass"
 
-        echo "  GPU ${GPU_FREQ} MHz / ${mv} mV: PASS"
+        echo "  GPU ${GPU_FREQ} MHz / ${mv} mV: PASS (live ${GPU_POINT_LIVE_MV} mV, ${GPU_POINT_GOOD_SAMPLES} samples held the point)"
         write_state GPU "$mv" "$last_pass"
-
-        stop_gpu_stress
 
         mv=$((mv + GPU_STEP_MV))
     done
@@ -1740,23 +2046,25 @@ run_gpu_test() {
 # Cleanup
 # -----------------------------------------------------------------------------
 restore_services() {
-    if [[ "$ORIG_CPU_SERVICE_ACTIVE" -eq 1 ]] &&
-        [[ -n "$CPU_SERVICE_UNIT" ]]; then
+    local unit
 
-        log "Restoring previously active CPU OC service."
-        systemctl start "$CPU_SERVICE_UNIT" 2>/dev/null || true
-    elif (( RUN_CPU )); then
+    for unit in "${STOPPED_CPU_UNITS[@]}"; do
+        log "Restoring previously active CPU OC service: $unit"
+        systemctl start "$unit" 2>/dev/null || true
+    done
+
+    if (( ORIG_CPU_SERVICE_ACTIVE != 1 )) && (( RUN_CPU )); then
         if ! restore_cpu_baseline 2>/dev/null; then
             log "WARNING: Failed to restore CPU baseline during cleanup."
         fi
     fi
 
-    if [[ "$ORIG_GPU_SERVICE_ACTIVE" -eq 1 ]] &&
-        [[ -n "$GPU_GOVERNOR_UNIT" ]]; then
+    for unit in "${STOPPED_GPU_UNITS[@]}"; do
+        log "Restoring previously active GPU SMU service: $unit"
+        systemctl start "$unit" 2>/dev/null || true
+    done
 
-        log "Restoring previously active GPU governor."
-        systemctl start "$GPU_GOVERNOR_UNIT" 2>/dev/null || true
-    elif (( RUN_GPU )); then
+    if (( ORIG_GPU_SERVICE_ACTIVE != 1 )) && (( RUN_GPU )); then
         # No GPU governor was active before the test. Restore the test-only
         # thermal change to the stock runtime limit.
         if ! write_gpu_temp_baseline 90 2>/dev/null; then
@@ -1856,8 +2164,8 @@ main() {
         fi
     elif (( RESUME_GPU == 1 )); then
         cpu_rc=10
-        CPU_LAST_PASS="$(state_get_field cpu_last_pass)"
-        CPU_FAILURE_POINT="$(state_get_field cpu_point)"
+        CPU_LAST_PASS="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
+        CPU_FAILURE_POINT="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
         CPU_FAILURE_REASON="CPU phase stopped before the saved point completed."
         echo
         echo "CPU phase resumed as interrupted; skipping directly to GPU."
@@ -1908,7 +2216,11 @@ main() {
 
     if [[ "$gpu_rc" -ne 0 ]]; then
         echo
-        echo "GPU silicon-quality failure detected."
+        if (( GPU_INVALID )); then
+            echo "GPU measurement invalid: this run does not support a silicon-quality conclusion."
+        else
+            echo "GPU silicon-quality failure detected."
+        fi
     fi
 
     show_test_report

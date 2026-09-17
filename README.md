@@ -72,17 +72,56 @@ the loaded telemetry interval.
 - Clock: `1500 MHz`
 - Starting voltage: `900 mV`
 - Step: `-10 mV`
-- Floor: `600 mV`
+- Floor: `650 mV`
 - Duration: `30 seconds` per point
 - Temperature limit: `90 C`
 
 The GPU sweep applies a fixed clock and steps the forced GPU voltage downward.
-The GPU clock is verified after `vkmark` starts, while the GPU is under load.
-GPU voltage shown in telemetry is a live measured voltage; it is not a
-readback of the requested/programmed voltage.
-If the live GPU clock does not hold the requested frequency during startup,
-the script restarts that voltage pass up to two times before classifying the
-point as a GPU clock-verification failure.
+Every point is verified against the live SMU readback three times over:
+
+1. Immediately after applying it (frequency and voltage, polled until the SMU
+   settles instead of sampled once).
+2. Again after `vkmark` starts, so a point that does not survive the load is
+   never accepted.
+3. On every five-second telemetry sample for the whole interval.
+
+A point counts as a pass only when all of those samples report the requested
+clock and a voltage within `5 mV` of the requested value. The pass line prints
+the live voltage that was actually measured.
+
+If the readback disagrees with the requested point, the point is restarted once
+from scratch. If it disagrees again the sweep stops and reports
+`GPU result: INVALID MEASUREMENT` - not a pass and not a silicon failure -
+because a point that was not held says nothing about silicon quality either way.
+
+## SMU exclusivity
+
+The GPU governor and this test drive the same SMU mailbox over the BC-250 PCI
+config file, and the governor re-applies its own point (its top safe point is
+`1500 MHz / 900 mV`) as soon as the GPU gets busy - which is exactly when a test
+point starts. With the governor running, a sweep that forces `870 mV` can end up
+running at `900 mV` and still report a pass.
+
+Before the GPU sweep the script therefore:
+
+- detects the governor units (`cyan-skillfish-governor-smu.service`, and the
+  plain/tt/oberon variants) plus `bc250-smu-oc.service`, using a
+  pipefail-safe lookup,
+- stops each active one and waits until systemd reports it inactive,
+- confirms that no process still holds
+  `/sys/bus/pci/devices/0000:00:00.0/config`,
+- re-checks before every point, and aborts with an invalid measurement if an
+  SMU client reappears.
+
+All stopped services are restarted during cleanup. If you need the governor to
+stay up, hand the SMU over with its own D-Bus test mode instead of forcing the
+point behind its back - TestMode disables automatic adjustment while keeping
+thermal throttling active:
+
+```bash
+sudo busctl --system call com.cyanskillfish.Governor /com/cyanskillfish/Governor \
+    com.cyanskillfish.Governor.TestMode SetTestMode uu 1500 870
+```
 
 ## Telemetry
 
@@ -112,6 +151,12 @@ the boundary found by this sweep and workload.
 CPU `stress-ng` exiting unexpectedly is treated as the CPU silicon cutoff and
 allows a combined run to continue to the GPU phase. A GPU `vkmark` exit is
 treated as a failed GPU point.
+
+A GPU point whose live SMU readback does not match the requested clock and
+voltage - before the interval, after `vkmark` starts, or during it - is
+reported as `INVALID MEASUREMENT`. That means another SMU client or the
+firmware overrode the test point; the run says nothing about silicon quality
+and should be repeated with exclusive SMU access before drawing conclusions.
 
 ## Interrupted runs and recovery
 
@@ -155,11 +200,13 @@ The script:
   initializes the pacman keyring, synchronizes packages, and relocks root.
 - Does not enable services at boot.
 - Does not write persistent CPU/GPU tuning configuration.
-- Temporarily stops conflicting CPU/GPU tuning services when necessary.
+- Temporarily stops conflicting CPU/GPU tuning services, verifies each one is
+  really stopped, and restarts it during cleanup.
 - Restores the CPU baseline and GPU force state during cleanup.
 - Handles `SIGINT` and `SIGTERM` cleanup paths.
 
-Do not run other CPU/GPU tuning tools simultaneously with the test. A hard
+Do not run other CPU/GPU tuning tools simultaneously with the test: anything
+else driving the SMU mailbox invalidates the point being measured. A hard
 lock can require a physical reboot, and no software can checkpoint work that
 was not written before the lock.
 
