@@ -80,6 +80,9 @@ The GPU sweep applies a fixed clock and steps the forced GPU voltage downward.
 The GPU clock is verified after `vkmark` starts, while the GPU is under load.
 GPU voltage shown in telemetry is a live measured voltage; it is not a
 readback of the requested/programmed voltage.
+If the live GPU clock does not hold the requested frequency during startup,
+the script restarts that voltage pass up to two times before classifying the
+point as a GPU clock-verification failure.
 
 ## Telemetry
 

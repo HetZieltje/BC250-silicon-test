@@ -67,6 +67,7 @@ stress_pid=""
 vkmark_pid=""
 
 SMU_RETRIES=3
+GPU_CLOCK_RESTARTS=2
 RUN_CPU=1
 RUN_GPU=1
 USE_DEFAULT_VALUES=0
@@ -543,6 +544,18 @@ state_set_field() {
     mv -f "$tmp" "$STATE_FILE"
 }
 
+state_get_field() {
+    local field="$1"
+
+    [[ -f "$STATE_FILE" ]] || return 0
+    awk -v field="$field" '
+        index($0, field "=") == 1 {
+            print substr($0, length(field) + 2)
+            exit
+        }
+    ' "$STATE_FILE"
+}
+
 state_remove_field() {
     local field="$1"
     local tmp="${STATE_FILE}.tmp"
@@ -579,10 +592,10 @@ show_previous_state() {
     local saved_cpu_status
     local saved_gpu_status
     local saved_gpu_point
-    saved_phase="$(awk -F= '$1 == "phase" {print $2}' "$STATE_FILE")"
-    saved_cpu_status="$(awk -F= '$1 == "cpu_status" {print $2}' "$STATE_FILE")"
-    saved_gpu_status="$(awk -F= '$1 == "gpu_status" {print $2}' "$STATE_FILE")"
-    saved_gpu_point="$(awk -F= '$1 == "gpu_point" {print $2}' "$STATE_FILE")"
+    saved_phase="$(state_get_field phase)"
+    saved_cpu_status="$(state_get_field cpu_status)"
+    saved_gpu_status="$(state_get_field gpu_status)"
+    saved_gpu_point="$(state_get_field gpu_point)"
 
     if [[ "$saved_phase" == "CPU" &&
         ( "$saved_cpu_status" == "IN_PROGRESS" || "$saved_cpu_status" == "FAILED_INTERRUPTED" ) ]]; then
@@ -591,10 +604,10 @@ show_previous_state() {
         local saved_cpu_vid_history
         local saved_cpu_point
 
-        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
-        saved_cpu_last_pass_vid="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
-        saved_cpu_vid_history="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
-        saved_cpu_point="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
+        saved_cpu_last_pass="$(state_get_field cpu_last_pass)"
+        saved_cpu_last_pass_vid="$(state_get_field cpu_last_pass_vid)"
+        saved_cpu_vid_history="$(state_get_field cpu_vid_history)"
+        saved_cpu_point="$(state_get_field cpu_point)"
 
         echo
         echo "The previous CPU phase was interrupted before it completed."
@@ -637,9 +650,9 @@ show_previous_state() {
             return 0
         fi
 
-        saved_gpu_last_pass="$(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE")"
-        saved_cpu_status="$(awk -F= '$1 == "cpu_status" {print $2}' "$STATE_FILE")"
-        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
+        saved_gpu_last_pass="$(state_get_field gpu_last_pass)"
+        saved_cpu_status="$(state_get_field cpu_status)"
+        saved_cpu_last_pass="$(state_get_field cpu_last_pass)"
         state_set_field gpu_status "FAILED"
         state_set_field gpu_failure_point "$saved_gpu_point"
         state_set_field gpu_failure_reason "System hard-locked during the GPU point; ${saved_gpu_point} mV is the cutoff."
@@ -654,9 +667,9 @@ show_previous_state() {
         RUN_CPU=1
         RUN_GPU=1
         CPU_LAST_PASS="${saved_cpu_last_pass:-none}"
-        CPU_LAST_PASS_VID="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
-        CPU_VID_HISTORY="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
-        CPU_FAILURE_POINT="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
+        CPU_LAST_PASS_VID="$(state_get_field cpu_last_pass_vid)"
+        CPU_VID_HISTORY="$(state_get_field cpu_vid_history)"
+        CPU_FAILURE_POINT="$(state_get_field cpu_point)"
         if [[ ( -z "$CPU_LAST_PASS_VID" || "$CPU_LAST_PASS_VID" == "none" ) &&
             -n "$CPU_VID_HISTORY" ]]; then
             CPU_LAST_PASS_VID="$(printf '%s\n' "$CPU_VID_HISTORY" |
@@ -697,15 +710,15 @@ show_previous_state() {
 
     if [[ -n "$saved_cpu_status" ]]; then
         RUN_CPU=1
-        saved_cpu_last_pass="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
-        saved_cpu_last_pass_vid="$(awk -F= '$1 == "cpu_last_pass_vid" {print $2}' "$STATE_FILE")"
-        saved_cpu_vid_history="$(awk -F= '$1 == "cpu_vid_history" {print $2}' "$STATE_FILE")"
-        saved_cpu_failure_point="$(awk -F= '$1 == "cpu_failure_point" {print $2}' "$STATE_FILE")"
-        saved_cpu_failure_reason="$(awk -F= '$1 == "cpu_failure_reason" {print $2}' "$STATE_FILE")"
+        saved_cpu_last_pass="$(state_get_field cpu_last_pass)"
+        saved_cpu_last_pass_vid="$(state_get_field cpu_last_pass_vid)"
+        saved_cpu_vid_history="$(state_get_field cpu_vid_history)"
+        saved_cpu_failure_point="$(state_get_field cpu_failure_point)"
+        saved_cpu_failure_reason="$(state_get_field cpu_failure_reason)"
         CPU_LAST_PASS="${saved_cpu_last_pass:-none}"
         CPU_LAST_PASS_VID="${saved_cpu_last_pass_vid:-none}"
         CPU_VID_HISTORY="${saved_cpu_vid_history:-}"
-        CPU_FAILURE_POINT="${saved_cpu_failure_point:-$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")}"
+        CPU_FAILURE_POINT="${saved_cpu_failure_point:-$(state_get_field cpu_point)}"
         CPU_FAILURE_REASON="${saved_cpu_failure_reason:-CPU phase stopped before the saved point completed.}"
         if [[ "$CPU_LAST_PASS_VID" == "none" && -n "$CPU_VID_HISTORY" ]]; then
             CPU_LAST_PASS_VID="$(printf '%s\n' "$CPU_VID_HISTORY" |
@@ -726,11 +739,11 @@ show_previous_state() {
 
     if [[ -n "$saved_gpu_status" ]]; then
         RUN_GPU=1
-        saved_gpu_last_pass="$(awk -F= '$1 == "gpu_last_pass" {print $2}' "$STATE_FILE")"
-        saved_gpu_failure_point="$(awk -F= '$1 == "gpu_failure_point" {print $2}' "$STATE_FILE")"
-        saved_gpu_failure_reason="$(awk -F= '$1 == "gpu_failure_reason" {print $2}' "$STATE_FILE")"
+        saved_gpu_last_pass="$(state_get_field gpu_last_pass)"
+        saved_gpu_failure_point="$(state_get_field gpu_failure_point)"
+        saved_gpu_failure_reason="$(state_get_field gpu_failure_reason)"
         GPU_LAST_PASS="${saved_gpu_last_pass:-none}"
-        GPU_FAILURE_POINT="${saved_gpu_failure_point:-$(awk -F= '$1 == "gpu_point" {print $2}' "$STATE_FILE")}"
+        GPU_FAILURE_POINT="${saved_gpu_failure_point:-$(state_get_field gpu_point)}"
         GPU_FAILURE_REASON="${saved_gpu_failure_reason:-GPU phase stopped before the saved point completed.}"
         if [[ "$saved_gpu_status" == "PASS" ]]; then
             gpu_rc=0
@@ -1588,6 +1601,7 @@ run_gpu_test() {
     local last_pass=""
     local interval_status=0
     local point_status=0
+    local clock_restart=0
     GPU_LAST_PASS="none"
     GPU_FAILURE_POINT="none"
     GPU_FAILURE_REASON=""
@@ -1632,23 +1646,45 @@ run_gpu_test() {
             return 13
         fi
 
-        start_gpu_stress
+        clock_restart=0
+        while true; do
+            start_gpu_stress
 
-        log "GPU point active: ${GPU_FREQ} MHz / ${mv} mV / GPU ${GPU_TEST_TEMP}C"
+            log "GPU point active: ${GPU_FREQ} MHz / ${mv} mV / GPU ${GPU_TEST_TEMP}C"
 
-        if ! verify_gpu_point "$GPU_FREQ"; then
+            if verify_gpu_point "$GPU_FREQ"; then
+                break
+            fi
+
             stop_gpu_stress
-            echo
-            echo "GPU: FAILURE"
-            echo "GPU failure candidate = ${mv} mV"
-            echo "GPU last confirmed pass = ${last_pass:-none} mV"
-            echo "Reason: the live GPU clock did not reach the requested frequency under stress."
-            echo "The point is classified as a failed GPU clock verification."
-            GPU_LAST_PASS="${last_pass:-none}"
-            GPU_FAILURE_POINT="$mv"
-            GPU_FAILURE_REASON="Live GPU clock did not reach ${GPU_FREQ} MHz under stress."
-            return 14
-        fi
+            if (( clock_restart >= GPU_CLOCK_RESTARTS )); then
+                echo
+                echo "GPU: FAILURE"
+                echo "GPU failure candidate = ${mv} mV"
+                echo "GPU last confirmed pass = ${last_pass:-none} mV"
+                echo "Reason: the live GPU clock did not reach the requested frequency under stress after ${GPU_CLOCK_RESTARTS} pass restarts."
+                echo "The point is classified as a failed GPU clock verification."
+                GPU_LAST_PASS="${last_pass:-none}"
+                GPU_FAILURE_POINT="$mv"
+                GPU_FAILURE_REASON="Live GPU clock did not reach ${GPU_FREQ} MHz under stress after ${GPU_CLOCK_RESTARTS} pass restarts."
+                return 14
+            fi
+
+            clock_restart=$((clock_restart + 1))
+            log "GPU live clock did not hold ${GPU_FREQ} MHz; restarting pass ${clock_restart}/${GPU_CLOCK_RESTARTS}."
+            if ! clear_gpu_point || ! start_gpu_point "$mv"; then
+                echo
+                echo "GPU: FAILURE"
+                echo "GPU failure candidate = ${mv} mV"
+                echo "GPU last confirmed pass = ${last_pass:-none} mV"
+                echo "Reason: the GPU point could not be reapplied while restarting the pass."
+                echo "The point is classified as a failed GPU setup."
+                GPU_LAST_PASS="${last_pass:-none}"
+                GPU_FAILURE_POINT="$mv"
+                GPU_FAILURE_REASON="GPU point could not be reapplied while restarting the pass."
+                return 13
+            fi
+        done
 
         interval_status=0
         run_test_interval GPU "$GPU_TEST_SECONDS" || interval_status=$?
@@ -1820,8 +1856,8 @@ main() {
         fi
     elif (( RESUME_GPU == 1 )); then
         cpu_rc=10
-        CPU_LAST_PASS="$(awk -F= '$1 == "cpu_last_pass" {print $2}' "$STATE_FILE")"
-        CPU_FAILURE_POINT="$(awk -F= '$1 == "cpu_point" {print $2}' "$STATE_FILE")"
+        CPU_LAST_PASS="$(state_get_field cpu_last_pass)"
+        CPU_FAILURE_POINT="$(state_get_field cpu_point)"
         CPU_FAILURE_REASON="CPU phase stopped before the saved point completed."
         echo
         echo "CPU phase resumed as interrupted; skipping directly to GPU."
